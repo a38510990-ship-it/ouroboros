@@ -43,6 +43,7 @@ TOOL_MODULES = [
     "ouroboros.tools.control",
     "ouroboros.tools.browser",
     "ouroboros.tools.review",
+    "ouroboros.tools.channel_monitor",
 ]
 
 SUPERVISOR_MODULES = [
@@ -110,6 +111,8 @@ EXPECTED_TOOLS = [
     "analyze_screenshot", "vlm_query",
     # Message routing
     "forward_to_worker",
+    # Channel monitoring
+    "check_channel",
     # Context management
     "compact_context",
     "list_available_tools",
