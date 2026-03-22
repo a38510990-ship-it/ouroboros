@@ -1,14 +1,21 @@
-# Secrets — never commit these
+# Secrets (NEVER commit these)
 .env
-credentials.json
 token.json
+credentials.json
+client_secret.json
 
-# Python
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+
+# Virtual environments
 .venv/
 venv/
+env/
 
 # Logs
 *.log
+logs/
