@@ -1,199 +1,163 @@
 #!/usr/bin/env python3
 """
-oauth_setup.py — First-time Google OAuth 2.0 authorization
+oauth_setup.py — Google OAuth 2.0 Setup
 
-Run this script ONCE to authorize access to your Google account.
-It will open a browser window and ask you to log in.
-After authorization, a token.json file is saved for future use.
+Run this script ONCE to authorize the bot to access your Google Sheets.
+It opens a browser window for you to sign in with your Google account.
+After authorization, it saves token.json in the bookshelf/ directory.
+
+The token is automatically refreshed when it expires — you only need to run
+this script once.
 
 Usage:
     python bookshelf/oauth_setup.py
 
-Prerequisites:
-    1. Create a Google Cloud project (see README.md for instructions)
-    2. Enable Google Sheets API and Google Drive API
-    3. Create OAuth 2.0 credentials (Desktop app type)
-    4. Download credentials.json to the bookshelf/ folder
+Requirements:
+    - credentials.json in bookshelf/ directory
+      (downloaded from Google Cloud Console)
+    - Run from anywhere; the script uses paths relative to its own location
+
+What this script does:
+    1. Reads credentials.json
+    2. Opens browser for Google sign-in
+    3. Saves token.json with access + refresh tokens
+    4. Verifies connection to Google Sheets API
 """
 
 import json
 import sys
 from pathlib import Path
 
-# Paths
 HERE = Path(__file__).parent
-CREDENTIALS_PATH = HERE / "credentials.json"
-TOKEN_PATH = HERE / "token.json"
-
-# OAuth scopes needed
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
 
 
-def check_dependencies() -> bool:
-    """Check that required packages are installed."""
-    missing = []
-    try:
-        import google.auth
-    except ImportError:
-        missing.append("google-auth")
-    try:
-        import google_auth_oauthlib
-    except ImportError:
-        missing.append("google-auth-oauthlib")
+def main() -> None:
+    print()
+    print("=" * 60)
+    print("  Bookshelf Bot — Google OAuth Setup")
+    print("=" * 60)
+    print()
+
+    # ── Step 1: Check dependencies ─────────────────────────────────
+    print("Checking dependencies...")
     try:
         import gspread
-    except ImportError:
-        missing.append("gspread")
-
-    if missing:
-        print("❌ Missing dependencies. Install them with:")
-        print(f"   pip install {' '.join(missing)}")
-        return False
-    return True
-
-
-def check_credentials() -> bool:
-    """Check that credentials.json exists and looks valid."""
-    if not CREDENTIALS_PATH.exists():
-        print(f"❌ credentials.json not found at: {CREDENTIALS_PATH}")
+        from google.auth.transport.requests import Request
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        print("✅ Dependencies OK")
+    except ImportError as e:
+        print(f"❌ Missing dependency: {e}")
         print()
-        print("Please follow these steps:")
+        print("Install with:")
+        print("    pip install -r bookshelf/requirements.txt")
+        sys.exit(1)
+
+    print()
+
+    # ── Step 2: Check for credentials.json ────────────────────────
+    creds_path = HERE / "credentials.json"
+    if not creds_path.exists():
+        print("❌ credentials.json not found!")
+        print()
+        print("To get credentials.json:")
         print()
         print("1. Go to: https://console.cloud.google.com/")
         print("2. Create a new project (or select existing)")
         print("3. Enable APIs:")
-        print("   - Go to 'APIs & Services' → 'Enable APIs'")
-        print("   - Enable 'Google Sheets API'")
-        print("   - Enable 'Google Drive API'")
+        print("   - Google Sheets API")
+        print("   - Google Drive API")
+        print("   (APIs & Services → Enable APIs → search for each)")
+        print()
         print("4. Create OAuth credentials:")
-        print("   - Go to 'APIs & Services' → 'Credentials'")
-        print("   - Click 'Create Credentials' → 'OAuth 2.0 Client ID'")
-        print("   - Application type: 'Desktop app'")
-        print("   - Name: 'Bookshelf Bot' (or anything)")
-        print("   - Click 'Create'")
-        print("5. Download the credentials:")
-        print("   - Click the download icon next to your new credential")
-        print(f"   - Save the file as: {CREDENTIALS_PATH}")
+        print("   - APIs & Services → Credentials")
+        print("   - Create Credentials → OAuth client ID")
+        print("   - Application type: Desktop App")
+        print("   - Name: Bookshelf Bot (or anything)")
+        print("   - Click Create → Download JSON")
         print()
-        print("Then run this script again.")
-        return False
+        print("5. Rename the downloaded file to: credentials.json")
+        print(f"6. Place it in: {HERE}/")
+        print()
+        sys.exit(1)
 
-    # Basic validation
-    try:
-        with open(CREDENTIALS_PATH) as f:
-            creds_data = json.load(f)
-
-        if "installed" not in creds_data and "web" not in creds_data:
-            print("❌ credentials.json doesn't look like an OAuth 2.0 credentials file.")
-            print("   Make sure you downloaded 'OAuth 2.0 Client ID' credentials,")
-            print("   not a service account key.")
-            return False
-    except json.JSONDecodeError:
-        print("❌ credentials.json is not valid JSON.")
-        return False
-
-    return True
-
-
-def authorize() -> None:
-    """Run the OAuth flow and save token.json."""
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    print()
-    print("🔐 Starting Google OAuth 2.0 authorization...")
+    print(f"✅ credentials.json found: {creds_path}")
     print()
 
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(CREDENTIALS_PATH),
-        scopes=SCOPES,
-    )
+    # ── Step 3: Run OAuth flow ─────────────────────────────────────
+    token_path = HERE / "token.json"
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
 
-    # Try local server first (opens browser automatically)
-    # Falls back to console flow if no browser available
+    if token_path.exists():
+        print(f"⚠️  token.json already exists at: {token_path}")
+        answer = input("Re-authorize? [y/N]: ").strip().lower()
+        if answer != "y":
+            print("Keeping existing token.")
+            _verify_connection(token_path, scopes)
+            return
+        token_path.unlink()
+
+    print("Opening browser for Google sign-in...")
+    print("(If the browser doesn't open automatically, check the terminal for a URL)")
+    print()
+
     try:
-        print("Opening browser for authorization...")
-        print("(If browser doesn't open, copy the URL shown and paste it manually)")
-        print()
-        creds = flow.run_local_server(port=0)
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), scopes)
+        creds = flow.run_local_server(port=0, open_browser=True)
     except Exception as e:
-        print(f"Browser auth failed ({e}), trying console flow...")
-        creds = flow.run_console()
+        print(f"❌ OAuth flow failed: {e}")
+        print()
+        print("Common issues:")
+        print("- Browser didn't open: copy the URL from the terminal and open manually")
+        print("- 'redirect_uri_mismatch': add 'http://localhost' to authorized redirect URIs")
+        print("  in Google Cloud Console (APIs & Services → Credentials → your OAuth client)")
+        sys.exit(1)
 
-    # Save credentials
-    with open(TOKEN_PATH, "w") as f:
+    # Save token
+    with open(token_path, "w") as f:
         f.write(creds.to_json())
 
+    print(f"✅ Token saved to: {token_path}")
     print()
-    print(f"✅ Authorization successful!")
-    print(f"   Token saved to: {TOKEN_PATH}")
-    print()
-    print("🚀 You can now run the bot:")
-    print("   python bookshelf/bot.py")
+
+    # ── Step 4: Verify connection ──────────────────────────────────
+    _verify_connection(token_path, scopes)
 
 
-def test_connection() -> bool:
-    """Test that the saved token actually works."""
+def _verify_connection(token_path: Path, scopes: list) -> None:
+    """Test the credentials by listing spreadsheets."""
+    print("Testing connection to Google Sheets...")
+
     try:
         import gspread
-        from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
 
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
         client = gspread.authorize(creds)
 
-        # Try to list spreadsheets (minimal permission check)
-        client.list_spreadsheet_files()
+        # Try to list spreadsheets (just a connectivity test)
+        spreadsheets = client.list_spreadsheet_files()
+        count = len(spreadsheets)
 
-        print("✅ Google Sheets connection: OK")
-        return True
+        print(f"✅ Connection successful!")
+        if count > 0:
+            print(f"   Found {count} existing spreadsheet(s) in your Drive")
+        print()
+        print("You're all set! Now you can start the bot:")
+        print("    python bookshelf/bot.py")
+        print()
 
+    except FileNotFoundError:
+        print(f"❌ token.json not found at {token_path}")
     except Exception as e:
-        print(f"⚠️  Connection test failed: {e}")
-        print("   The token was saved but there might be an issue.")
-        print("   Try running the bot and see if it works.")
-        return False
-
-
-def main() -> None:
-    """Main entry point."""
-    print("=" * 50)
-    print("  Bookshelf Catalog — Google OAuth Setup")
-    print("=" * 50)
-
-    # Check dependencies
-    if not check_dependencies():
-        sys.exit(1)
-
-    # Check credentials file
-    if not check_credentials():
-        sys.exit(1)
-
-    # Check if already authorized
-    if TOKEN_PATH.exists():
-        print(f"ℹ️  token.json already exists at: {TOKEN_PATH}")
-        answer = input("   Re-authorize? [y/N]: ").strip().lower()
-        if answer != "y":
-            print("Skipping authorization.")
-            test_connection()
-            return
-
-    # Run authorization
-    try:
-        authorize()
-        test_connection()
-    except KeyboardInterrupt:
-        print("\n\nAuthorization cancelled.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Authorization failed: {e}")
-        sys.exit(1)
+        print(f"❌ Connection test failed: {e}")
+        print()
+        print("The token was saved, but the connection test failed.")
+        print("Common cause: Google Cloud project configuration issue.")
+        print("Make sure Sheets API and Drive API are enabled.")
 
 
 if __name__ == "__main__":
