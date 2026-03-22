@@ -1,6 +1,8 @@
 """
-Google Sheets module: write enriched books to a spreadsheet.
-Uses OAuth credentials from token.json.
+Google Sheets module: append book catalog entries using OAuth credentials.
+
+Creates the sheet if it doesn't exist. Appends rows on each new photo.
+Handles duplicate sheet names gracefully.
 """
 import logging
 from datetime import datetime, timezone
@@ -17,86 +19,108 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Column headers for the catalog sheet
-HEADERS = [
-    "Date Added",
-    "Title (from photo)",
-    "Author (from photo)",
-    "Title (confirmed)",
-    "Authors (confirmed)",
-    "Year",
-    "ISBN",
-    "Categories",
-    "Language",
-    "Pages",
-    "Description",
-    "Google Books Link",
+# Column order in the spreadsheet
+COLUMNS = [
+    "Date Added",         # When the photo was processed
+    "Title (VLM)",        # Title as read by AI
+    "Author (VLM)",       # Author as read by AI
+    "Title (Confirmed)",  # Title from Google Books
+    "Author (Confirmed)", # Author from Google Books
+    "Year",               # Publication year
+    "ISBN",               # ISBN-13 or ISBN-10
+    "Categories",         # Book genres/categories
+    "Language",           # Book language code (en, ru, etc.)
+    "Pages",              # Page count
+    "Description",        # Short description
+    "Google Books Link",  # Link to Google Books entry
 ]
 
 
-def _get_gspread_client(token_path: str = "token.json") -> gspread.Client:
-    """Load OAuth credentials and return authorized gspread client."""
+def _load_credentials(token_path: str) -> Credentials:
+    """Load and refresh OAuth credentials from token.json."""
     path = Path(token_path)
     if not path.exists():
         raise FileNotFoundError(
-            "token.json not found. Run `python auth_google.py` first to authenticate."
+            f"Google token not found at {token_path}. "
+            "Run 'python auth_google.py' to authenticate."
         )
 
     creds = Credentials.from_authorized_user_file(str(path), SCOPES)
 
+    # Refresh if expired
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            logger.info("Refreshing expired OAuth token...")
+            logger.info("Refreshing expired Google OAuth token...")
             creds.refresh(Request())
+            # Save refreshed token
             path.write_text(creds.to_json())
+            logger.info("Token refreshed and saved.")
         else:
             raise RuntimeError(
-                "OAuth token is invalid. Run `python auth_google.py` again."
+                "Google credentials are invalid and cannot be refreshed. "
+                "Run 'python auth_google.py' to re-authenticate."
             )
 
-    return gspread.authorize(creds)
+    return creds
 
 
-def get_or_create_sheet(client: gspread.Client, sheet_name: str) -> gspread.Spreadsheet:
-    """Open existing spreadsheet or create a new one with headers."""
+def _get_or_create_sheet(client: gspread.Client, sheet_name: str) -> gspread.Spreadsheet:
+    """Get existing spreadsheet by name or create a new one."""
     try:
         spreadsheet = client.open(sheet_name)
-        logger.info(f"Opened existing sheet: {sheet_name}")
+        logger.info(f"Found existing spreadsheet: {sheet_name}")
+        return spreadsheet
     except gspread.SpreadsheetNotFound:
-        logger.info(f"Creating new sheet: {sheet_name}")
+        logger.info(f"Creating new spreadsheet: {sheet_name}")
         spreadsheet = client.create(sheet_name)
-        # Add headers to first worksheet
-        worksheet = spreadsheet.sheet1
-        worksheet.update("A1", [HEADERS])
-        # Format headers: bold
-        worksheet.format("A1:L1", {
-            "textFormat": {"bold": True},
-            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-        })
-        logger.info("Headers added to new sheet")
-
-    return spreadsheet
+        # Make it accessible (optional: share with yourself)
+        # spreadsheet.share(your_email, perm_type='user', role='writer')
+        return spreadsheet
 
 
-def append_books(books: list[dict], sheet_name: str, token_path: str = "token.json") -> str:
+def _ensure_header(worksheet: gspread.Worksheet) -> None:
+    """Add header row if the sheet is empty."""
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        worksheet.append_row(COLUMNS, value_input_option="RAW")
+        logger.info("Added header row to sheet.")
+    elif all_values[0] != COLUMNS:
+        # Sheet has data but wrong header — insert header at top
+        logger.warning("Sheet has data but no matching header — skipping header insert.")
+
+
+def append_books(
+    books: list[dict],
+    sheet_name: str,
+    token_path: str,
+) -> str:
     """
-    Append a list of enriched books to the Google Sheet.
-    Creates the sheet if it doesn't exist.
+    Append enriched book data to a Google Sheet.
+
+    Args:
+        books: List of enriched book dicts (from enrich_books)
+        sheet_name: Name of the Google Sheet to create/update
+        token_path: Path to OAuth token.json file
 
     Returns:
-        URL of the spreadsheet.
+        URL of the Google Sheet
     """
     if not books:
-        logger.warning("No books to append")
+        logger.warning("No books to append.")
         return ""
 
-    client = _get_gspread_client(token_path)
-    spreadsheet = get_or_create_sheet(client, sheet_name)
+    creds = _load_credentials(token_path)
+    client = gspread.authorize(creds)
+
+    spreadsheet = _get_or_create_sheet(client, sheet_name)
     worksheet = spreadsheet.sheet1
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _ensure_header(worksheet)
 
+    # Build rows to append
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows = []
+
     for book in books:
         row = [
             now,
@@ -114,7 +138,22 @@ def append_books(books: list[dict], sheet_name: str, token_path: str = "token.js
         ]
         rows.append(row)
 
+    # Batch append all rows at once
     worksheet.append_rows(rows, value_input_option="USER_ENTERED")
-    logger.info(f"Appended {len(rows)} rows to sheet '{sheet_name}'")
+    logger.info(f"Appended {len(rows)} rows to '{sheet_name}'")
 
-    return spreadsheet.url
+    sheet_url = spreadsheet.url
+    logger.info(f"Sheet URL: {sheet_url}")
+    return sheet_url
+
+
+def get_sheet_url(sheet_name: str, token_path: str) -> str:
+    """Get the URL of the catalog sheet without modifying it."""
+    creds = _load_credentials(token_path)
+    client = gspread.authorize(creds)
+
+    try:
+        spreadsheet = client.open(sheet_name)
+        return spreadsheet.url
+    except gspread.SpreadsheetNotFound:
+        return ""
