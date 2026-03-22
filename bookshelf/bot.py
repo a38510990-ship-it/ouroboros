@@ -1,24 +1,28 @@
-#!/usr/bin/env python3
 """
 bot.py — Bookshelf Catalog Telegram Bot
 
-Sends photos of bookshelves → recognizes books via VLM → enriches with
-Google Books API → saves to Google Sheets.
-
-Usage:
-    python bookshelf/bot.py
-
-Environment variables (bookshelf/.env):
-    TELEGRAM_BOT_TOKEN   — from @BotFather
-    OPENROUTER_API_KEY   — from openrouter.ai/keys
-    GOOGLE_SHEET_NAME    — spreadsheet name (default: "Bookshelf Catalog")
-
-Before first run:
-    python bookshelf/oauth_setup.py  ← authorize Google Sheets access
+Main entry point. Runs the bot and dispatches incoming messages.
 
 Commands:
-    /start   — welcome message and instructions
-    /sheet   — show link to the catalog spreadsheet
+    /start  — Welcome message and usage instructions
+    /sheet  — Show the link to the catalog spreadsheet
+    /help   — Same as /start
+
+Photo handling:
+    User sends a photo → VLM recognizes books → Google Books enriches →
+    New books added to spreadsheet (with deduplication) → Reply with summary
+
+Environment variables (bookshelf/.env):
+    TELEGRAM_BOT_TOKEN   — Bot token from @BotFather
+    OPENROUTER_API_KEY   — OpenRouter API key
+    VLM_MODEL            — Vision model (default: google/gemini-2.0-flash-001)
+    GOOGLE_SHEET_NAME    — Spreadsheet name (default: Bookshelf Catalog)
+
+First-time setup:
+    1. pip install -r bookshelf/requirements.txt
+    2. python bookshelf/oauth_setup.py
+    3. Create bookshelf/.env with your tokens
+    4. python bookshelf/bot.py
 """
 
 import logging
@@ -36,227 +40,263 @@ from telegram.ext import (
     filters,
 )
 
-# Load .env from bookshelf/ directory
+from books_api import enrich_books
+from sheets import BookshelfSheet
+from vision import recognize_books
+
+# ── Setup ──────────────────────────────────────────────────────────────────────
+
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Silence noisy libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-
-# ── Config ─────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Bookshelf Catalog")
 
+TOKEN_PATH = HERE / "token.json"
 
-# ── Command: /start ────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _check_setup() -> str | None:
+    """
+    Check if the bot is properly configured.
+
+    Returns a human-readable error message if something is wrong,
+    or None if everything is OK.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return "TELEGRAM_BOT_TOKEN is not set. Add it to bookshelf/.env"
+
+    if not os.getenv("OPENROUTER_API_KEY"):
+        return "OPENROUTER_API_KEY is not set. Add it to bookshelf/.env"
+
+    if not TOKEN_PATH.exists():
+        return (
+            "Google Sheets not authorized.\n"
+            "Run: python bookshelf/oauth_setup.py"
+        )
+
+    return None
+
+
+def _get_sheet() -> BookshelfSheet:
+    """Get a BookshelfSheet instance (created fresh per request for simplicity)."""
+    return BookshelfSheet(sheet_name=GOOGLE_SHEET_NAME)
+
+
+# ── Command handlers ───────────────────────────────────────────────────────────
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message."""
-    await update.message.reply_text(
+    """Handle /start and /help commands."""
+    text = (
         "📚 <b>Bookshelf Catalog Bot</b>\n\n"
-        "Send me a photo of your bookshelf and I'll:\n"
-        "1. Recognize all the books visible on the spines\n"
-        "2. Look them up in Google Books for full details\n"
-        "3. Add them to your Google Sheets catalog\n\n"
+        "I recognize books from photos of your bookshelf and add them to a Google Sheets catalog.\n\n"
+        "<b>How to use:</b>\n"
+        "1. Take a photo of your bookshelf (spines facing you)\n"
+        "2. Send the photo to this chat\n"
+        "3. I'll recognize the books and add them to your catalog\n\n"
         "<b>Commands:</b>\n"
-        "/sheet — view your catalog spreadsheet\n\n"
-        "Just send a photo to get started! 📸",
-        parse_mode=ParseMode.HTML,
+        "/sheet — Show link to your catalog spreadsheet\n"
+        "/help — Show this message\n\n"
+        "📎 <i>Each photo adds new books. Already-cataloged books are skipped automatically.</i>"
     )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-# ── Command: /sheet ────────────────────────────────────────────────────────────
 async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the link to the spreadsheet."""
-    from sheets import BookshelfSheet
-
-    await update.message.reply_text("🔍 Looking up your spreadsheet...")
+    """Handle /sheet command — show the spreadsheet URL."""
+    await update.message.reply_text("🔍 Opening your catalog...")
 
     try:
-        sheet = BookshelfSheet(sheet_name=GOOGLE_SHEET_NAME)
+        sheet = _get_sheet()
         url = sheet.get_url()
         await update.message.reply_text(
-            f"📊 <b>Your catalog:</b>\n{url}",
+            f"📊 <b>Your Bookshelf Catalog:</b>\n{url}",
             parse_mode=ParseMode.HTML,
         )
     except FileNotFoundError:
         await update.message.reply_text(
-            "❌ <b>Google Sheets not set up yet</b>\n\n"
-            "Run this command first:\n"
+            "❌ Google Sheets is not authorized yet.\n\n"
+            "Run this command on your machine:\n"
             "<code>python bookshelf/oauth_setup.py</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         logger.error(f"Error in /sheet: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Error accessing spreadsheet: {e}"
+            f"❌ Could not open spreadsheet: {e}"
         )
 
 
 # ── Photo handler ──────────────────────────────────────────────────────────────
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Process a bookshelf photo:
-    1. Download the image
-    2. Recognize books with VLM
+    Handle incoming photos.
+
+    Flow:
+    1. Download photo (highest resolution)
+    2. Send to VLM for book recognition
     3. Enrich with Google Books API
     4. Add to Google Sheets (with dedup)
-    5. Reply with results
+    5. Reply with summary
     """
-    from books_api import enrich_books
-    from sheets import BookshelfSheet
-    from vision import recognize_books
+    msg = update.message
+    await msg.reply_text("📷 Processing your photo... This may take 10-30 seconds.")
 
-    # Tell user we're working on it
-    processing_msg = await update.message.reply_text("🔍 Analyzing your bookshelf...")
-
+    # ── Step 1: Download photo ─────────────────────────────────────────────────
     try:
-        # ── Download photo ─────────────────────────────────────────
         # Telegram sends multiple sizes; use the largest one
-        photo = update.message.photo[-1]
+        photo = msg.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
         image_bytes = bytes(image_bytes)
         logger.info(f"Downloaded photo: {len(image_bytes)} bytes")
+    except Exception as e:
+        logger.error(f"Failed to download photo: {e}", exc_info=True)
+        await msg.reply_text("❌ Failed to download your photo. Please try again.")
+        return
 
-        # ── Recognize books with VLM ───────────────────────────────
-        await processing_msg.edit_text("🤖 Recognizing books...")
-
+    # ── Step 2: Recognize books with VLM ──────────────────────────────────────
+    await msg.reply_text("🔍 Recognizing books...")
+    try:
         raw_books = await recognize_books(image_bytes)
-        logger.info(f"VLM recognized {len(raw_books)} books")
-
-        if not raw_books:
-            await processing_msg.edit_text(
-                "😕 I couldn't recognize any books in this photo.\n\n"
-                "Tips for better results:\n"
-                "• Make sure book spines are clearly visible\n"
-                "• Good lighting helps a lot\n"
-                "• Avoid blurry photos"
-            )
-            return
-
-        # ── Enrich with Google Books API ───────────────────────────
-        await processing_msg.edit_text(
-            f"📖 Found {len(raw_books)} book(s). Looking up details..."
+    except RuntimeError as e:
+        await msg.reply_text(f"❌ Book recognition failed:\n{e}")
+        return
+    except Exception as e:
+        logger.error(f"Unexpected VLM error: {e}", exc_info=True)
+        await msg.reply_text(
+            "❌ Something went wrong during book recognition. Please try again."
         )
+        return
 
-        enriched_books = await enrich_books(raw_books)
-        logger.info(f"Enriched {len(enriched_books)} books")
+    if not raw_books:
+        await msg.reply_text(
+            "🤷 I couldn't recognize any books in this photo.\n\n"
+            "Tips:\n"
+            "• Make sure book spines are clearly visible\n"
+            "• Use good lighting\n"
+            "• Try a closer shot"
+        )
+        return
 
-        # ── Add to Google Sheets ───────────────────────────────────
-        await processing_msg.edit_text("📊 Saving to your catalog...")
+    await msg.reply_text(f"📖 Recognized {len(raw_books)} book(s). Looking up details...")
 
-        try:
-            sheet = BookshelfSheet(sheet_name=GOOGLE_SHEET_NAME)
-            added, skipped = sheet.add_books(enriched_books)
-            sheet_url = sheet.get_url()
-        except FileNotFoundError:
-            await processing_msg.edit_text(
-                "❌ <b>Google Sheets not authorized</b>\n\n"
-                "Run this once to set it up:\n"
-                "<code>python bookshelf/oauth_setup.py</code>\n\n"
-                f"I recognized these books:\n{_format_book_list(enriched_books)}",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+    # ── Step 3: Enrich with Google Books ──────────────────────────────────────
+    try:
+        books = await enrich_books(raw_books)
+    except Exception as e:
+        logger.error(f"Google Books enrichment failed: {e}", exc_info=True)
+        # Use raw data as fallback
+        books = [
+            {"Title": b["title"], "Author": b["author"],
+             "Year": "", "ISBN": "", "Genre": "", "Pages": "", "Cover URL": ""}
+            for b in raw_books
+        ]
 
-        # ── Build response ─────────────────────────────────────────
-        response_lines = []
-
-        if added:
-            response_lines.append(f"✅ <b>Added {len(added)} book(s):</b>")
-            for book in added:
-                response_lines.append(_format_book_line(book))
-
-        if skipped:
-            response_lines.append(f"\n⏭️ <b>Skipped {len(skipped)} duplicate(s):</b>")
-            for book in skipped:
-                title = book.get("Title", "?")
-                response_lines.append(f"  • {title} (already in catalog)")
-
-        response_lines.append(f"\n📊 <a href='{sheet_url}'>Open catalog</a>")
-
-        await processing_msg.edit_text(
-            "\n".join(response_lines),
+    # ── Step 4: Add to Google Sheets ──────────────────────────────────────────
+    try:
+        sheet = _get_sheet()
+        added, skipped = sheet.add_books(books)
+    except FileNotFoundError:
+        await msg.reply_text(
+            "❌ Google Sheets is not authorized.\n\n"
+            "Run: <code>python bookshelf/oauth_setup.py</code>",
             parse_mode=ParseMode.HTML,
         )
-
-        logger.info(f"Done: added={len(added)}, skipped={len(skipped)}")
-
-    except RuntimeError as e:
-        # Known errors (API key missing, VLM timeout, etc.)
-        logger.error(f"RuntimeError processing photo: {e}")
-        await processing_msg.edit_text(f"❌ {e}")
-
+        return
     except Exception as e:
-        logger.error(f"Unexpected error processing photo: {e}", exc_info=True)
-        await processing_msg.edit_text(
-            "❌ Something went wrong. Please try again.\n"
-            f"Error: {type(e).__name__}: {e}"
+        logger.error(f"Failed to write to Google Sheets: {e}", exc_info=True)
+        await msg.reply_text(
+            f"❌ Could not write to Google Sheets: {e}\n\n"
+            "Books recognized but not saved."
+        )
+        return
+
+    # ── Step 5: Reply with summary ─────────────────────────────────────────────
+    reply = _build_reply(added, skipped, sheet.get_url())
+    await msg.reply_text(reply, parse_mode=ParseMode.HTML)
+
+
+def _build_reply(added: list[dict], skipped: list[dict], sheet_url: str) -> str:
+    """Build a human-readable summary of the operation."""
+    lines = []
+
+    if added:
+        lines.append(f"✅ <b>Added {len(added)} book(s):</b>")
+        for book in added:
+            title = book.get("Title", "Unknown")
+            author = book.get("Author", "")
+            year = book.get("Year", "")
+            if author and year:
+                lines.append(f"  • {title} — {author} ({year})")
+            elif author:
+                lines.append(f"  • {title} — {author}")
+            else:
+                lines.append(f"  • {title}")
+
+    if skipped:
+        lines.append(f"\n⏭ <b>Skipped {len(skipped)} duplicate(s):</b>")
+        for book in skipped:
+            lines.append(f"  • {book.get('Title', 'Unknown')}")
+
+    if not added and not skipped:
+        lines.append("🤷 No books were processed.")
+
+    lines.append(f"\n📊 <a href=\"{sheet_url}\">View your catalog</a>")
+
+    return "\n".join(lines)
+
+
+# ── Unsupported message types ──────────────────────────────────────────────────
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle documents (e.g., images sent as files)."""
+    doc = update.message.document
+    if doc and doc.mime_type and doc.mime_type.startswith("image/"):
+        await update.message.reply_text(
+            "📎 Please send the image as a <b>photo</b>, not as a file.\n"
+            "In Telegram, choose 'Photo' instead of 'File' when attaching.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            "I only process photos of bookshelves. "
+            "Send me a photo and I'll catalog the books! 📚"
         )
 
 
-# ── Formatting helpers ─────────────────────────────────────────────────────────
-
-def _format_book_line(book: dict) -> str:
-    """Format a single book as a text line."""
-    title = book.get("Title", "?")
-    author = book.get("Author", "")
-    year = book.get("Year", "")
-
-    parts = [f"  • <b>{title}</b>"]
-    if author:
-        parts.append(f" by {author}")
-    if year:
-        parts.append(f" ({year})")
-
-    return "".join(parts)
-
-
-def _format_book_list(books: list[dict]) -> str:
-    """Format a list of books."""
-    if not books:
-        return "(none)"
-    return "\n".join(_format_book_line(b) for b in books)
-
-
-# ── Error handler ──────────────────────────────────────────────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log unexpected errors."""
-    logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain text messages."""
+    await update.message.reply_text(
+        "Send me a photo of your bookshelf and I'll catalog the books! 📚\n"
+        "Use /help to see all commands."
+    )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+
+
 def main() -> None:
     """Start the bot."""
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN is not set")
-        print("  Create bookshelf/.env and add: TELEGRAM_BOT_TOKEN=your_token_here")
+    # Pre-flight checks
+    error = _check_setup()
+    if error:
+        logger.error(f"Setup error: {error}")
+        print(f"\n❌ Setup error: {error}\n")
         return
 
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("❌ OPENROUTER_API_KEY is not set")
-        print("  Add to bookshelf/.env: OPENROUTER_API_KEY=your_key_here")
-        return
-
-    # Check for token.json
-    token_path = HERE / "token.json"
-    if not token_path.exists():
-        print("⚠️  token.json not found — Google Sheets access not authorized")
-        print("  Run: python bookshelf/oauth_setup.py")
-        print("  (The bot will start anyway, but /sheet and photo processing will fail)")
-        print()
-
-    logger.info(f"Starting bot (sheet: '{GOOGLE_SHEET_NAME}')")
+    logger.info(f"Starting Bookshelf Catalog Bot (sheet: '{GOOGLE_SHEET_NAME}')")
 
     app = (
         Application.builder()
@@ -264,14 +304,15 @@ def main() -> None:
         .build()
     )
 
-    # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
+    # Register handlers
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_error_handler(error_handler)
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
