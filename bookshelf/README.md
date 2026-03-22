@@ -1,107 +1,95 @@
 # 📚 Bookshelf Catalog Bot
 
-Telegram-бот для каталогизации книжных полок. Отправь фото — получи список книг в Google Sheets.
+Telegram-бот, который распознаёт книги на фото книжной полки и сохраняет их в Google Sheets.
 
 ## Как это работает
 
 ```
-Фото полки (Telegram)
-    ↓
-VLM (OpenRouter)        ← распознаёт названия и авторов с корешков
-    ↓
-Google Books API        ← обогащает: год, ISBN, жанр, страницы, обложка
-    ↓
-Google Sheets           ← добавляет новые книги (дедупликация по ISBN/Title+Author)
-    ↓
-Ответ в Telegram        ← "Добавлено 5 книг: [список]"
+Ты → фото полки → Telegram Bot
+                       ↓
+              VLM (OpenRouter) — читает корешки
+                       ↓
+              Google Books API — название, автор, год, ISBN
+                       ↓
+              Google Sheets (твой Drive) — таблица накапливается
 ```
 
-## Структура таблицы Google Sheets
+## Структура файлов
 
-| Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added |
-|-------|--------|------|------|-------|-------|-----------|------------|
+```
+bookshelf/
+├── README.md          # Эта инструкция
+├── requirements.txt   # Зависимости
+├── bot.py             # Основной файл бота
+├── vision.py          # OpenRouter VLM интеграция
+├── sheets.py          # Google Sheets / gspread
+├── books_api.py       # Google Books API
+├── oauth_setup.py     # Первичная OAuth авторизация (запустить один раз)
+└── .env.example       # Пример переменных окружения
+```
 
-## Setup
+## Быстрый старт
 
-### 1. Зависимости
+### 1. Установить зависимости
 
 ```bash
 pip install -r bookshelf/requirements.txt
 ```
 
-### 2. Telegram Bot Token
+### 2. Настроить переменные окружения
 
-1. Напиши [@BotFather](https://t.me/botfather) в Telegram
-2. `/newbot` → следуй инструкциям
-3. Скопируй токен
-
-### 3. OpenRouter API Key
-
-1. Зарегистрируйся на [openrouter.ai](https://openrouter.ai)
-2. Создай API key в настройках
-
-### 4. Google Cloud + OAuth (один раз)
-
-#### 4.1. Создай Google Cloud проект
-
-1. Зайди на [console.cloud.google.com](https://console.cloud.google.com)
-2. Создай новый проект (или выбери существующий)
-3. В поиске найди **"Google Sheets API"** → Enable
-4. В поиске найди **"Google Drive API"** → Enable
-
-#### 4.2. Создай OAuth credentials
-
-1. Перейди в **APIs & Services → Credentials**
-2. Нажми **Create Credentials → OAuth client ID**
-3. Тип: **Desktop application**
-4. Скачай JSON файл
-5. Переименуй его в `credentials.json` и положи в папку `bookshelf/`
-
-> ⚠️ Если видишь "This app isn't verified" — нажми "Continue" (это нормально для личных проектов)
-
-#### 4.3. Первичная авторизация
-
-```bash
-cd bookshelf
-python oauth_setup.py
-```
-
-Откроется браузер → разреши доступ → в папке появится `token.json`.
-
-После этого бот может работать без браузера.
-
-### 5. Переменные окружения
+Скопировать `.env.example` в `.env` и заполнить:
 
 ```bash
 cp bookshelf/.env.example bookshelf/.env
-# Отредактируй bookshelf/.env
 ```
 
-```env
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-OPENROUTER_API_KEY=sk-or-v1-...
-GOOGLE_SHEET_NAME=Bookshelf Catalog
-VLM_MODEL=google/gemini-2.0-flash-001
+Нужны:
+- `TELEGRAM_BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
+- `OPENROUTER_API_KEY` — ключ от [openrouter.ai](https://openrouter.ai)
+
+### 3. Настроить Google Sheets (OAuth)
+
+#### Создать Google Cloud проект
+
+1. Зайти на [console.cloud.google.com](https://console.cloud.google.com)
+2. Создать новый проект (например, "Bookshelf Bot")
+3. В боковом меню: **APIs & Services → Library**
+4. Найти и включить:
+   - **Google Sheets API**
+   - **Google Drive API**
+5. В боковом меню: **APIs & Services → Credentials**
+6. Нажать **Create Credentials → OAuth client ID**
+7. Application type: **Desktop app**
+8. Скачать JSON-файл → сохранить как `bookshelf/credentials.json`
+
+#### Авторизоваться (один раз)
+
+```bash
+python bookshelf/oauth_setup.py
 ```
 
-### 6. Запуск
+Скрипт:
+- Откроет браузер для авторизации в твоём Google-аккаунте
+- Создаст `bookshelf/token.json` (сохраняется автоматически)
+- Создаст таблицу "Bookshelf Catalog" в твоём Drive
+- Выведет ID таблицы
+
+Скопировать ID таблицы в `.env`:
+```
+GOOGLE_SHEET_ID=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
+```
+
+### 4. Запустить бота
 
 ```bash
 python bookshelf/bot.py
 ```
 
-**В Colab:**
-
+В Colab:
 ```python
-import subprocess, os
-os.chdir('/content/ouroboros_repo')
-!pip install -r bookshelf/requirements.txt -q
-
-# Запустить OAuth (один раз, через ngrok или локально)
-# !python bookshelf/oauth_setup.py
-
-# Запустить бота
-!python bookshelf/bot.py
+import subprocess
+proc = subprocess.Popen(["python", "bookshelf/bot.py"])
 ```
 
 ## Команды бота
@@ -109,28 +97,36 @@ os.chdir('/content/ouroboros_repo')
 | Команда | Описание |
 |---------|----------|
 | `/start` | Приветствие и инструкция |
-| `/sheet` | Ссылка на Google Sheets таблицу |
-| Фото | Распознать книги и добавить в таблицу |
+| `/sheet` | Ссылка на таблицу в Google Drive |
+| Фото 📷 | Распознать книги и добавить в таблицу |
 
-## Поддерживаемые VLM модели
+## Структура таблицы
 
-| Модель | Качество | Цена |
-|--------|----------|------|
-| `google/gemini-2.0-flash-001` | Хорошее | Дёшево |
-| `anthropic/claude-3.5-sonnet` | Отличное | Средне |
-| `openai/gpt-4o` | Отличное | Средне |
-| `google/gemini-2.5-pro-preview` | Лучшее | Дорого |
+| Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added |
+|-------|--------|------|------|-------|-------|-----------|------------|
 
-## Дедупликация
+## VLM модели (в .env)
 
-Бот проверяет каждую найденную книгу перед добавлением:
-1. Сначала по **ISBN** (точное совпадение)
-2. Затем по **Title + Author** (нечёткое совпадение, нижний регистр)
+```
+# Бесплатные (могут быть лимиты):
+VLM_MODEL=google/gemini-2.0-flash-thinking-exp:free
 
-Уже существующие книги не добавляются повторно.
+# Платные (лучше качество):
+VLM_MODEL=anthropic/claude-3.5-sonnet
+VLM_MODEL=google/gemini-2.0-flash-001
+```
 
-## Файлы (не коммитятся)
+## Переменные окружения
 
-- `bookshelf/.env` — секреты
-- `bookshelf/token.json` — OAuth токен (генерируется oauth_setup.py)
-- `bookshelf/credentials.json` — Google OAuth credentials (скачивается из Google Cloud)
+| Переменная | Обязательная | Описание |
+|-----------|-------------|----------|
+| `TELEGRAM_BOT_TOKEN` | ✅ | Токен бота от BotFather |
+| `OPENROUTER_API_KEY` | ✅ | API ключ OpenRouter |
+| `GOOGLE_SHEET_ID` | ✅ | ID Google Sheets таблицы |
+| `VLM_MODEL` | ❌ | VLM модель (по умолчанию: gemini-2.0-flash-thinking-exp:free) |
+
+## Файлы в .gitignore
+
+- `credentials.json` — OAuth credentials (секрет)
+- `token.json` — OAuth токен (секрет)
+- `.env` — переменные окружения (секрет)
