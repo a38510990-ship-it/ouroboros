@@ -1,14 +1,16 @@
 """
-vision.py — VLM (Vision Language Model) integration via OpenRouter
+vision.py — Book recognition via VLM (Vision Language Model)
 
-Uses a vision-capable model to recognize books from a bookshelf photo.
+Uses OpenRouter API to analyze bookshelf photos and extract book information.
 Returns a list of {title, author} dicts for further enrichment.
 
-Supported models (via OpenRouter):
-    - google/gemini-2.0-flash-001      (default: fast, cheap)
-    - anthropic/claude-3.5-sonnet      (excellent quality)
-    - openai/gpt-4o                    (excellent quality)
-    - google/gemini-2.5-pro-preview    (best quality)
+Supported models (set via VLM_MODEL env var):
+    - google/gemini-2.0-flash-001 (default — fast, cheap, good quality)
+    - anthropic/claude-3.5-sonnet (best quality)
+    - openai/gpt-4o (excellent quality)
+
+The prompt is designed to extract book spine text reliably,
+including books with obscured, partial, or stylized spines.
 """
 
 import base64
@@ -17,7 +19,6 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -29,61 +30,64 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 VLM_MODEL = os.getenv("VLM_MODEL", "google/gemini-2.0-flash-001")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-REQUEST_TIMEOUT = 90.0
 
-RECOGNITION_PROMPT = """You are analyzing a photo of a bookshelf. Your task is to identify all visible books.
+# Prompt for book recognition
+RECOGNITION_PROMPT = """You are analyzing a photo of a bookshelf.
 
-For each book you can see (fully or partially), extract:
-- title: the book's title (as accurately as possible)
-- author: the author's name (if visible on the spine)
+Your task: identify ALL books visible in the photo.
 
-Return ONLY a JSON array. No explanations, no markdown, just JSON.
-
-Format:
-[
-  {"title": "Book Title", "author": "Author Name"},
-  {"title": "Another Book", "author": ""},
-  ...
-]
+For each book you can see (even partially), extract:
+1. Title (as printed on the spine/cover)
+2. Author (if visible on the spine/cover)
 
 Rules:
-- Include ALL visible books, even if you can only read part of the title
-- If author is not visible on the spine, use empty string ""
-- Correct obvious OCR errors (e.g., "Hairy Potter" → "Harry Potter")
-- If you cannot identify any books at all, return an empty array: []
-"""
+- Include ALL books, even if you can only read part of the title
+- If the author is not visible, leave it empty
+- Do NOT make up information — only what you can actually see
+- Books may be horizontal or vertical
+- Include books in any language
+
+Return a JSON array. Example:
+[
+  {"title": "The Pragmatic Programmer", "author": "David Thomas"},
+  {"title": "Clean Code", "author": "Robert C. Martin"},
+  {"title": "Дюна", "author": "Фрэнк Херберт"}
+]
+
+If no books are visible, return an empty array: []
+Return ONLY the JSON array, no other text."""
 
 
 async def recognize_books(image_bytes: bytes) -> list[dict]:
     """
-    Recognize books in a bookshelf photo using a VLM.
+    Recognize books in a bookshelf photo using VLM.
 
     Args:
         image_bytes: Raw image bytes (JPEG, PNG, WebP, etc.)
 
     Returns:
         List of dicts with 'title' and 'author' keys.
-        Returns empty list if no books recognized.
+        Returns empty list if no books found or on error.
 
     Raises:
-        EnvironmentError: If OPENROUTER_API_KEY is not set.
-        RuntimeError: If the API request fails after retries.
+        RuntimeError: If OpenRouter API key is not set.
+        httpx.HTTPError: If the API request fails.
     """
     if not OPENROUTER_API_KEY:
-        raise EnvironmentError(
+        raise RuntimeError(
             "OPENROUTER_API_KEY is not set. "
-            "Add it to bookshelf/.env or environment variables."
+            "Add it to bookshelf/.env"
         )
 
-    # Detect MIME type from image header bytes
+    # Detect image MIME type
     mime_type = _detect_mime_type(image_bytes)
-    logger.info(f"Processing image: {len(image_bytes)} bytes, MIME: {mime_type}, model: {VLM_MODEL}")
+    logger.info(f"Processing image: {len(image_bytes)} bytes, type: {mime_type}")
 
-    # Encode image to base64
+    # Encode to base64
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     image_url = f"data:{mime_type};base64,{image_b64}"
 
-    # Build the request
+    # Build request
     payload = {
         "model": VLM_MODEL,
         "messages": [
@@ -101,141 +105,144 @@ async def recognize_books(image_bytes: bytes) -> list[dict]:
                 ],
             }
         ],
-        "max_tokens": 2048,
+        "max_tokens": 2000,
+        "temperature": 0.1,  # Low temperature for factual extraction
     }
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/ouroboros-bot/bookshelf",
+        "HTTP-Referer": "https://github.com/ouroboros-project/bookshelf",
         "X-Title": "Bookshelf Catalog Bot",
     }
 
-    # Make API request with retry
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        try:
-            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            error_body = e.response.text[:500]
-            logger.error(f"OpenRouter API error {e.response.status_code}: {error_body}")
-            raise RuntimeError(
-                f"VLM API returned {e.response.status_code}: {error_body}"
-            ) from e
-        except httpx.RequestError as e:
-            logger.error(f"Network error calling OpenRouter: {e}")
-            raise RuntimeError(f"Network error: {e}") from e
+    logger.info(f"Sending image to VLM: {VLM_MODEL}")
 
-    # Parse response
-    data = response.json()
-    raw_text = _extract_text(data)
-    logger.debug(f"VLM response: {raw_text[:200]}")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
 
-    books = _parse_books(raw_text)
+    # Extract text response
+    content = data["choices"][0]["message"]["content"]
+    logger.debug(f"VLM raw response: {content[:500]}")
+
+    # Parse JSON from response
+    books = _parse_books_json(content)
     logger.info(f"Recognized {len(books)} books")
+
     return books
 
 
 def _detect_mime_type(image_bytes: bytes) -> str:
-    """Detect image MIME type from magic bytes."""
-    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+    """
+    Detect image MIME type from file signature (magic bytes).
+
+    Defaults to image/jpeg if unknown.
+    """
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
-    elif image_bytes[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+    elif image_bytes[:4] in (b"RIFF", b"WEBP"):
         return "image/webp"
-    elif image_bytes[:4] in (b"GIF8", b"GIF9"):
+    elif image_bytes[:4] == b"GIF8":
         return "image/gif"
+    elif image_bytes[:2] in (b"BM",):
+        return "image/bmp"
     else:
-        # Default to JPEG (most common for photos)
-        return "image/jpeg"
+        return "image/jpeg"  # Default assumption
 
 
-def _extract_text(api_response: dict) -> str:
-    """Extract text content from OpenRouter API response."""
-    try:
-        choices = api_response.get("choices", [])
-        if not choices:
-            logger.warning("No choices in VLM response")
-            return "[]"
-        message = choices[0].get("message", {})
-        content = message.get("content", "[]")
-        if not content:
-            return "[]"
-        return content
-    except (KeyError, IndexError, TypeError) as e:
-        logger.warning(f"Error parsing VLM response structure: {e}")
-        return "[]"
-
-
-def _parse_books(text: str) -> list[dict]:
+def _parse_books_json(content: str) -> list[dict]:
     """
-    Parse VLM output into a list of book dicts.
+    Parse the VLM response to extract a list of books.
 
-    Handles:
-    - Clean JSON arrays
-    - JSON wrapped in markdown code blocks
-    - Partial/malformed JSON (best effort)
+    Handles cases where:
+    - Response is clean JSON
+    - Response has markdown code blocks (```json ... ```)
+    - Response has extra text before/after JSON
+
+    Returns:
+        List of {title, author} dicts. Empty list if parsing fails.
     """
-    if not text or not text.strip():
-        return []
-
     # Try direct JSON parse first
     try:
-        data = json.loads(text.strip())
+        data = json.loads(content.strip())
         if isinstance(data, list):
-            return _validate_books(data)
+            return _normalize_book_list(data)
     except json.JSONDecodeError:
         pass
 
-    # Try to extract JSON from markdown code blocks
-    # e.g., ```json\n[...]\n```
-    code_block_pattern = r"```(?:json)?\s*(\[.*?\])\s*```"
-    match = re.search(code_block_pattern, text, re.DOTALL)
-    if match:
+    # Try to extract JSON array from markdown code block
+    code_block_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", content, re.DOTALL)
+    if code_block_match:
         try:
-            data = json.loads(match.group(1))
+            data = json.loads(code_block_match.group(1))
             if isinstance(data, list):
-                return _validate_books(data)
+                return _normalize_book_list(data)
         except json.JSONDecodeError:
             pass
 
     # Try to find any JSON array in the text
-    array_pattern = r"\[.*?\]"
-    match = re.search(array_pattern, text, re.DOTALL)
-    if match:
+    array_match = re.search(r"\[.*?\]", content, re.DOTALL)
+    if array_match:
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(array_match.group(0))
             if isinstance(data, list):
-                return _validate_books(data)
+                return _normalize_book_list(data)
         except json.JSONDecodeError:
             pass
 
-    logger.warning(f"Could not parse VLM output as JSON: {text[:200]}")
+    logger.warning(f"Could not parse VLM response as JSON: {content[:300]}")
     return []
 
 
-def _validate_books(raw_list: list) -> list[dict]:
+def _normalize_book_list(raw_list: list) -> list[dict]:
     """
-    Validate and normalize a list of book dicts.
+    Normalize raw JSON list to clean {title, author} dicts.
 
-    Filters out entries without a title.
-    Normalizes keys to lowercase 'title' and 'author'.
+    Handles variations in key names:
+    - "title", "Title", "book_title", "name"
+    - "author", "Author", "authors", "writer"
     """
     books = []
+
     for item in raw_list:
         if not isinstance(item, dict):
             continue
 
-        # Normalize keys (handle capitalized variants)
-        title = str(
-            item.get("title") or item.get("Title") or ""
-        ).strip()
-        author = str(
-            item.get("author") or item.get("Author") or ""
-        ).strip()
+        # Extract title — try multiple possible key names
+        title = (
+            item.get("title")
+            or item.get("Title")
+            or item.get("book_title")
+            or item.get("name")
+            or ""
+        )
 
-        if title:
-            books.append({"title": title, "author": author})
+        # Extract author — try multiple possible key names
+        author_raw = (
+            item.get("author")
+            or item.get("Author")
+            or item.get("authors")
+            or item.get("writer")
+            or ""
+        )
+
+        # Handle list of authors
+        if isinstance(author_raw, list):
+            author = ", ".join(str(a) for a in author_raw if a)
+        else:
+            author = str(author_raw) if author_raw else ""
+
+        title = str(title).strip()
+        author = author.strip()
+
+        # Skip empty entries
+        if not title:
+            continue
+
+        books.append({"title": title, "author": author})
 
     return books
