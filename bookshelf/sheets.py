@@ -1,16 +1,11 @@
 """
 sheets.py — Google Sheets integration for Bookshelf Catalog
 
-Connects to Google Sheets using OAuth 2.0 credentials from token.json.
-Creates the spreadsheet if it doesn't exist.
-Adds books with deduplication (by ISBN, or Title+Author).
+Использует авторизацию через Google Colab — никакого Google Cloud проекта не нужно.
+Запускается в Colab, где пользователь уже залогинен в свой Google-аккаунт.
 
-Sheet structure:
+Структура таблицы:
     Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added
-
-Authentication:
-    Run oauth_setup.py once to create token.json.
-    The token auto-refreshes when it expires.
 """
 
 import logging
@@ -20,23 +15,11 @@ from pathlib import Path
 
 import gspread
 from dotenv import load_dotenv
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
 logger = logging.getLogger(__name__)
-
-# Paths
-TOKEN_PATH = HERE / "token.json"
-CREDENTIALS_PATH = HERE / "credentials.json"
-
-# Google API scopes
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
 
 # Sheet configuration
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Bookshelf Catalog")
@@ -44,11 +27,36 @@ WORKSHEET_NAME = "Books"
 COLUMNS = ["Title", "Author", "Year", "ISBN", "Genre", "Pages", "Cover URL", "Date Added"]
 
 
+def _authenticate():
+    """
+    Авторизация через Google Colab.
+
+    В Colab вызывает auth.authenticate_user() — открывает браузер один раз.
+    После этого google.auth.default() возвращает готовые credentials.
+
+    Никакого Google Cloud проекта, credentials.json или billing не нужно.
+    """
+    try:
+        from google.colab import auth
+        auth.authenticate_user()
+        logger.info("Colab authentication successful")
+    except ImportError:
+        # Не в Colab — пробуем application default credentials
+        logger.info("Not in Colab, using google.auth.default()")
+
+    import google.auth
+    creds, _ = google.auth.default(scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    return creds
+
+
 class BookshelfSheet:
     """
-    Interface to the Google Sheets catalog.
+    Интерфейс к Google Sheets каталогу.
 
-    Usage:
+    Использование:
         sheet = BookshelfSheet()
         added, skipped = sheet.add_books(books)
         url = sheet.get_url()
@@ -63,16 +71,13 @@ class BookshelfSheet:
 
     def add_books(self, books: list[dict]) -> tuple[list[dict], list[dict]]:
         """
-        Add books to the catalog, skipping duplicates.
+        Добавить книги в каталог, пропуская дубликаты.
 
         Args:
-            books: List of book dicts (output from enrich_books).
+            books: Список книг (output из enrich_books).
 
         Returns:
-            Tuple of (added, skipped) lists.
-
-        Raises:
-            FileNotFoundError: If token.json or credentials.json is missing.
+            Tuple из (added, skipped) списков.
         """
         ws = self._get_worksheet()
         existing_keys = self._get_existing_keys(ws)
@@ -89,7 +94,7 @@ class BookshelfSheet:
             else:
                 added.append(book)
                 rows_to_append.append(_book_to_row(book))
-                existing_keys.add(key)  # Prevent duplicates within this batch
+                existing_keys.add(key)
 
         if rows_to_append:
             ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
@@ -98,28 +103,22 @@ class BookshelfSheet:
         return added, skipped
 
     def get_url(self) -> str:
-        """
-        Return the spreadsheet URL.
-
-        Raises:
-            FileNotFoundError: If token.json is missing.
-        """
-        spreadsheet = self._get_spreadsheet()
-        return spreadsheet.url
+        """Вернуть ссылку на таблицу."""
+        return self._get_spreadsheet().url
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _get_client(self) -> gspread.Client:
-        """Get or create an authenticated gspread client."""
+        """Получить или создать авторизованный gspread клиент."""
         if self._client is not None:
             return self._client
 
-        creds = _load_credentials()
+        creds = _authenticate()
         self._client = gspread.authorize(creds)
         return self._client
 
     def _get_spreadsheet(self) -> gspread.Spreadsheet:
-        """Get or create the catalog spreadsheet."""
+        """Получить или создать таблицу."""
         if self._spreadsheet is not None:
             return self._spreadsheet
 
@@ -136,7 +135,7 @@ class BookshelfSheet:
         return spreadsheet
 
     def _get_worksheet(self) -> gspread.Worksheet:
-        """Get or create the Books worksheet with proper headers."""
+        """Получить или создать лист Books с заголовками."""
         if self._worksheet is not None:
             return self._worksheet
 
@@ -144,7 +143,6 @@ class BookshelfSheet:
 
         try:
             ws = spreadsheet.worksheet(WORKSHEET_NAME)
-            # Verify headers are correct
             headers = ws.row_values(1)
             if headers != COLUMNS:
                 logger.warning("Header mismatch, updating headers")
@@ -153,7 +151,6 @@ class BookshelfSheet:
             ws = spreadsheet.add_worksheet(WORKSHEET_NAME, rows=1000, cols=len(COLUMNS))
             ws.append_row(COLUMNS)
             logger.info(f"Created worksheet: {WORKSHEET_NAME!r}")
-            # If there was a default Sheet1, remove it
             try:
                 default_sheet = spreadsheet.worksheet("Sheet1")
                 spreadsheet.del_worksheet(default_sheet)
@@ -164,10 +161,7 @@ class BookshelfSheet:
         return ws
 
     def _get_existing_keys(self, ws: gspread.Worksheet) -> set[str]:
-        """
-        Get deduplication keys for all existing rows.
-        Returns a set of strings like "isbn:978..." or "title+author:...".
-        """
+        """Получить ключи дедупликации для существующих строк."""
         try:
             all_values = ws.get_all_records()
         except Exception as e:
@@ -187,38 +181,11 @@ class BookshelfSheet:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _load_credentials() -> Credentials:
-    """
-    Load and refresh Google OAuth credentials from token.json.
-
-    Raises:
-        FileNotFoundError: If token.json is not found.
-    """
-    if not TOKEN_PATH.exists():
-        raise FileNotFoundError(
-            f"token.json not found at {TOKEN_PATH}\n"
-            "Run: python bookshelf/oauth_setup.py"
-        )
-
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-
-    if creds.expired and creds.refresh_token:
-        logger.info("Refreshing expired credentials...")
-        creds.refresh(Request())
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
-        logger.info("Credentials refreshed and saved")
-
-    return creds
-
-
 def _dedup_key(book: dict) -> str:
     """
-    Generate a deduplication key for a book.
-
-    Priority:
-    1. ISBN (if present) → "isbn:9780..."
-    2. Title + Author (normalized) → "ta:the hitchhiker's guide|douglas adams"
+    Ключ дедупликации.
+    1. ISBN → "isbn:9780..."
+    2. Title + Author → "ta:название|автор"
     """
     isbn = str(book.get("ISBN", "")).strip()
     if isbn:
@@ -233,7 +200,7 @@ def _dedup_key(book: dict) -> str:
 
 
 def _book_to_row(book: dict) -> list[str]:
-    """Convert a book dict to a spreadsheet row (same order as COLUMNS)."""
+    """Конвертировать книгу в строку таблицы."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return [
         book.get("Title", ""),
