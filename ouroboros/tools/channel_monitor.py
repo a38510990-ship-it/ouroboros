@@ -12,15 +12,15 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 from bs4 import BeautifulSoup
+
+from ouroboros.tools.registry import ToolContext, ToolEntry
 
 # ─── constants ────────────────────────────────────────────────────────────────
 
 DEFAULT_CHANNEL = "abulaphia"
-DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/Ouroboros"))
-STATE_DIR = DRIVE_ROOT / "memory" / "channel_monitor"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -30,13 +30,14 @@ USER_AGENT = (
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _state_path(channel: str) -> Path:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    return STATE_DIR / f"{channel}.json"
+def _state_path(ctx: ToolContext, channel: str) -> Path:
+    state_dir = ctx.drive_root / "memory" / "channel_monitor"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / f"{channel}.json"
 
 
-def _load_state(channel: str) -> dict:
-    p = _state_path(channel)
+def _load_state(ctx: ToolContext, channel: str) -> dict:
+    p = _state_path(ctx, channel)
     if p.exists():
         try:
             return json.loads(p.read_text())
@@ -45,8 +46,8 @@ def _load_state(channel: str) -> dict:
     return {"last_id": 0}
 
 
-def _save_state(channel: str, state: dict) -> None:
-    _state_path(channel).write_text(json.dumps(state, indent=2))
+def _save_state(ctx: ToolContext, channel: str, state: dict) -> None:
+    _state_path(ctx, channel).write_text(json.dumps(state, indent=2))
 
 
 def _fetch_html(channel: str) -> str:
@@ -114,7 +115,6 @@ def _format_message(msg: dict) -> str:
     if media_tags:
         lines.append(" ".join(media_tags))
     if msg["text"]:
-        # Truncate very long posts
         body = msg["text"]
         if len(body) > 600:
             body = body[:600] + "…"
@@ -122,61 +122,45 @@ def _format_message(msg: dict) -> str:
     return "\n".join(lines)
 
 
-# ─── main tool function ───────────────────────────────────────────────────────
+# ─── main tool handler ────────────────────────────────────────────────────────
 
 
-def check_channel(channel: str = DEFAULT_CHANNEL, mark_read: bool = True) -> dict[str, Any]:
-    """Fetch the latest messages from a public Telegram channel web preview.
-
-    Reads https://t.me/s/{channel}, returns any messages newer than the
-    last-seen ID.  Persists the high-water mark on Drive.
-
-    Args:
-        channel: Telegram channel username (without @), e.g. "abulaphia".
-        mark_read: If True (default), advance the last-seen pointer so the
-                   next call only returns newer posts.
-
-    Returns:
-        {
-            "channel": str,
-            "new_count": int,
-            "last_id": int,
-            "messages": [{"id", "text", "datetime", "link", "has_photo", "has_video"}, ...],
-            "summary": str,   # human-readable digest
-            "error": str | None,
-        }
-    """
+def _check_channel(ctx: ToolContext, channel: str = DEFAULT_CHANNEL, mark_read: bool = True) -> str:
+    """Fetch new messages from a public Telegram channel web preview."""
     try:
         html = _fetch_html(channel)
     except urllib.error.URLError as exc:
-        return {
+        return json.dumps({
             "channel": channel,
             "new_count": 0,
             "last_id": 0,
             "messages": [],
             "summary": "",
             "error": f"Network error: {exc}",
-        }
+        }, ensure_ascii=False, indent=2)
 
     all_messages = _parse_messages(html)
     if not all_messages:
-        return {
+        return json.dumps({
             "channel": channel,
             "new_count": 0,
             "last_id": 0,
             "messages": [],
             "summary": "No messages found on channel preview page.",
             "error": None,
-        }
+        }, ensure_ascii=False, indent=2)
 
-    state = _load_state(channel)
+    state = _load_state(ctx, channel)
     last_id = state.get("last_id", 0)
 
     new_messages = [m for m in all_messages if m["id"] > last_id]
     new_max_id = max(m["id"] for m in all_messages)
 
     if mark_read and new_messages:
-        _save_state(channel, {"last_id": new_max_id, "updated_at": datetime.utcnow().isoformat()})
+        _save_state(ctx, channel, {
+            "last_id": new_max_id,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
 
     if new_messages:
         formatted = "\n\n---\n\n".join(_format_message(m) for m in new_messages)
@@ -184,24 +168,24 @@ def check_channel(channel: str = DEFAULT_CHANNEL, mark_read: bool = True) -> dic
     else:
         summary = f"No new posts in @{channel} since #{last_id}."
 
-    return {
+    return json.dumps({
         "channel": channel,
         "new_count": len(new_messages),
         "last_id": new_max_id,
         "messages": new_messages,
         "summary": summary,
         "error": None,
-    }
+    }, ensure_ascii=False, indent=2)
 
 
 # ─── tool registration ────────────────────────────────────────────────────────
 
 
-def get_tools() -> list[dict]:
+def get_tools() -> List[ToolEntry]:
     return [
-        {
-            "type": "function",
-            "function": {
+        ToolEntry(
+            name="check_channel",
+            schema={
                 "name": "check_channel",
                 "description": (
                     "Fetch new messages from a public Telegram channel web preview "
@@ -214,7 +198,9 @@ def get_tools() -> list[dict]:
                     "properties": {
                         "channel": {
                             "type": "string",
-                            "description": "Telegram channel username (without @). Default: 'abulaphia'.",
+                            "description": (
+                                "Telegram channel username (without @). Default: 'abulaphia'."
+                            ),
                         },
                         "mark_read": {
                             "type": "boolean",
@@ -224,5 +210,7 @@ def get_tools() -> list[dict]:
                     "required": [],
                 },
             },
-        }
+            handler=_check_channel,
+            timeout_sec=30,
+        )
     ]
