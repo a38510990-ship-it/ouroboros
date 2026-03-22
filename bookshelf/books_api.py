@@ -1,148 +1,180 @@
 """
 books_api.py — Google Books API integration
 
-Enriches raw book data (title/author from VLM) with:
-    - Full title
-    - Confirmed author
-    - Publication year
-    - ISBN-13 (or ISBN-10)
+Enriches book data (title, author) with:
+    - Year (publication date)
+    - ISBN-13 (preferred) or ISBN-10
     - Genre / categories
     - Page count
     - Cover image URL
+    - Cleaned title and author
 
 Uses the free Google Books API (no API key required).
-Documentation: https://developers.google.com/books/docs/v1/using
+Performs concurrent requests for speed.
 """
 
 import asyncio
 import logging
+from typing import Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
-REQUEST_TIMEOUT = 10.0
-MAX_CONCURRENT = 5  # Limit concurrent requests to be polite
+GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
+REQUEST_TIMEOUT = 15.0
+MAX_CONCURRENT = 5  # Max simultaneous requests to avoid rate limiting
 
 
 async def enrich_books(raw_books: list[dict]) -> list[dict]:
     """
-    Enrich a list of raw books with data from Google Books API.
+    Enrich a list of {title, author} dicts with Google Books data.
 
     Args:
-        raw_books: List of dicts with 'title' and 'author' keys
+        raw_books: List of dicts with 'title' and optionally 'author' keys
                    (as returned by vision.recognize_books)
 
     Returns:
-        List of enriched book dicts with all catalog fields.
-        Each dict has: Title, Author, Year, ISBN, Genre, Pages, Cover URL
+        List of enriched dicts with keys matching Google Sheet columns:
+        Title, Author, Year, ISBN, Genre, Pages, Cover URL
+
+    Note:
+        Returns original data if enrichment fails for a book.
+        Never drops books — if API fails, uses VLM-recognized data.
     """
     if not raw_books:
         return []
 
-    # Use semaphore to limit concurrent API calls
+    # Limit concurrency with semaphore
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         tasks = [
-            _enrich_one(book, client, semaphore)
+            _enrich_one(client, semaphore, book)
             for book in raw_books
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        enriched = await asyncio.gather(*tasks)
 
-    enriched = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to enrich '{raw_books[i].get('title')}': {result}")
-            # Fall back to raw data from VLM
-            enriched.append(_fallback(raw_books[i]))
-        else:
-            enriched.append(result)
-
-    return enriched
+    return list(enriched)
 
 
 async def _enrich_one(
-    book: dict,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    book: dict,
 ) -> dict:
-    """Enrich a single book via Google Books API."""
+    """Enrich a single book dict with Google Books data."""
     async with semaphore:
-        query = _build_query(book)
-        logger.debug(f"Querying Google Books: {query}")
-
         try:
-            response = await client.get(
-                BOOKS_API_URL,
-                params={"q": query, "maxResults": 1, "langRestrict": ""},
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"Google Books API error {e.response.status_code} for '{query}'")
-            return _fallback(book)
-        except httpx.RequestError as e:
-            logger.warning(f"Network error for '{query}': {e}")
-            return _fallback(book)
+            result = await _fetch_book_data(client, book)
+            if result:
+                logger.debug(f"Enriched: {result.get('Title', '?')} by {result.get('Author', '?')}")
+                return result
+        except Exception as e:
+            logger.warning(f"Failed to enrich '{book.get('title', '?')}': {e}")
 
-        items = data.get("items", [])
-        if not items:
-            logger.debug(f"No results for: {query}")
-            return _fallback(book)
-
-        return _parse_volume(items[0], book)
+    # Fallback: use VLM-recognized data
+    return {
+        "Title": book.get("title", ""),
+        "Author": book.get("author", ""),
+        "Year": "",
+        "ISBN": "",
+        "Genre": "",
+        "Pages": "",
+        "Cover URL": "",
+    }
 
 
-def _build_query(book: dict) -> str:
-    """Build a Google Books search query from raw book data."""
+async def _fetch_book_data(
+    client: httpx.AsyncClient,
+    book: dict,
+) -> Optional[dict]:
+    """
+    Query Google Books API for a book.
+
+    Tries queries in order:
+    1. Title + Author (most specific)
+    2. Title only (if author empty)
+    """
     title = book.get("title", "").strip()
     author = book.get("author", "").strip()
 
-    if title and author:
-        return f'intitle:"{title}" inauthor:"{author}"'
-    elif title:
-        return f'intitle:"{title}"'
+    if not title:
+        return None
+
+    # Build query
+    if author:
+        query = f'intitle:"{title}" inauthor:"{author}"'
     else:
-        return title  # Fallback (shouldn't happen)
+        query = f'intitle:"{title}"'
+
+    params = {
+        "q": query,
+        "maxResults": 1,
+        "printType": "books",
+        "langRestrict": "en",  # Can be removed for multi-language support
+    }
+
+    response = await client.get(GOOGLE_BOOKS_URL, params=params)
+    response.raise_for_status()
+    data = response.json()
+
+    items = data.get("items", [])
+
+    # If no results with author restriction, retry with title only
+    if not items and author:
+        params["q"] = f'intitle:"{title}"'
+        del params["langRestrict"]  # Broader search
+        response = await client.get(GOOGLE_BOOKS_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("items", [])
+
+    if not items:
+        logger.debug(f"No Google Books results for: {title}")
+        return None
+
+    return _parse_volume(items[0], book)
 
 
-def _parse_volume(volume: dict, original: dict) -> dict:
-    """
-    Parse a Google Books API volume into our catalog format.
+def _parse_volume(item: dict, original_book: dict) -> dict:
+    """Extract relevant fields from a Google Books API volume item."""
+    info = item.get("volumeInfo", {})
 
-    Prefers API data but falls back to original VLM data if API returns
-    empty fields.
-    """
-    info = volume.get("volumeInfo", {})
+    # Title — prefer API result, fall back to VLM
+    title = info.get("title", original_book.get("title", ""))
 
-    # Title — prefer API, fall back to VLM
-    title = info.get("title", "").strip() or original.get("title", "")
+    # Author — join multiple authors with comma
+    authors = info.get("authors", [])
+    if authors:
+        author = ", ".join(authors)
+    else:
+        author = original_book.get("author", "")
 
-    # Author — join multiple authors; fall back to VLM
-    api_authors = info.get("authors", [])
-    author = ", ".join(api_authors) if api_authors else original.get("author", "")
+    # Publication year
+    published_date = info.get("publishedDate", "")
+    year = published_date[:4] if published_date and len(published_date) >= 4 else ""
 
-    # Year — extract from publishedDate (can be "2001", "2001-06", or "2001-06-15")
-    published = info.get("publishedDate", "")
-    year = published[:4] if published else ""
-
-    # ISBN — prefer ISBN-13, fall back to ISBN-10
+    # ISBN — prefer ISBN-13
     isbn = _extract_isbn(info.get("industryIdentifiers", []))
 
-    # Genre — first category
+    # Categories / Genre
     categories = info.get("categories", [])
     genre = categories[0] if categories else ""
 
-    # Pages
-    pages = str(info.get("pageCount", "")) if info.get("pageCount") else ""
+    # Page count
+    pages = str(info.get("pageCount", "") or "")
+    if pages == "0":
+        pages = ""
 
-    # Cover image
+    # Cover image URL (highest quality available)
     image_links = info.get("imageLinks", {})
     cover_url = (
-        image_links.get("thumbnail", "")
-        or image_links.get("smallThumbnail", "")
+        image_links.get("extraLarge")
+        or image_links.get("large")
+        or image_links.get("medium")
+        or image_links.get("thumbnail")
+        or ""
     )
 
     return {
@@ -157,32 +189,16 @@ def _parse_volume(volume: dict, original: dict) -> dict:
 
 
 def _extract_isbn(identifiers: list[dict]) -> str:
-    """Extract ISBN-13 (preferred) or ISBN-10 from industry identifiers."""
+    """Extract ISBN from Google Books industry identifiers. Prefer ISBN-13."""
     isbn13 = ""
     isbn10 = ""
 
-    for identifier in identifiers:
-        id_type = identifier.get("type", "")
-        id_value = identifier.get("identifier", "")
+    for item in identifiers:
+        id_type = item.get("type", "")
+        identifier = item.get("identifier", "")
         if id_type == "ISBN_13":
-            isbn13 = id_value
+            isbn13 = identifier
         elif id_type == "ISBN_10":
-            isbn10 = id_value
+            isbn10 = identifier
 
     return isbn13 or isbn10
-
-
-def _fallback(book: dict) -> dict:
-    """
-    Create a catalog entry from raw VLM data (when API enrichment fails).
-    Fields that Google Books would have filled are left empty.
-    """
-    return {
-        "Title": book.get("title", ""),
-        "Author": book.get("author", ""),
-        "Year": "",
-        "ISBN": "",
-        "Genre": "",
-        "Pages": "",
-        "Cover URL": "",
-    }
