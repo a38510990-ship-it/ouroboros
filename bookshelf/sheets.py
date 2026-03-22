@@ -1,16 +1,17 @@
 """
-sheets.py — Google Sheets integration via gspread
+sheets.py — Google Sheets integration via gspread + OAuth 2.0
 
-Manages the bookshelf catalog spreadsheet.
-Uses OAuth 2.0 credentials from token.json (created by oauth_setup.py).
+Manages the bookshelf catalog spreadsheet:
+    - Opens (or creates) the spreadsheet by name
+    - Initializes headers if the sheet is empty
+    - Adds new books (with deduplication)
+    - Checks for duplicates by ISBN (preferred) or Title+Author
 
-The spreadsheet has one worksheet ("Books") with columns:
+Spreadsheet columns:
     Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added
 
-Deduplication:
-    Before adding a book, checks if it already exists by:
-    1. ISBN match (if available)
-    2. Title + Author match (case-insensitive)
+OAuth credentials are loaded from bookshelf/token.json.
+To generate token.json, run: python bookshelf/oauth_setup.py
 """
 
 import logging
@@ -24,19 +25,16 @@ from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 
-# Paths
 HERE = Path(__file__).parent
-TOKEN_PATH = HERE / "token.json"
-CREDENTIALS_PATH = HERE / "credentials.json"
 
-# OAuth scopes
+# Scopes needed to create and edit spreadsheets
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# Worksheet structure
-SHEET_HEADERS = [
+# Spreadsheet column headers (order matters — matches add_books logic)
+HEADERS = [
     "Title",
     "Author",
     "Year",
@@ -50,158 +48,56 @@ SHEET_HEADERS = [
 
 class BookshelfSheet:
     """
-    Interface to the Google Sheets bookshelf catalog.
+    Manages a single Google Sheets spreadsheet as a book catalog.
 
     Usage:
-        sheet = BookshelfSheet(sheet_name="My Books")
-        added, skipped = sheet.add_books(book_list)
+        sheet = BookshelfSheet(sheet_name="Bookshelf Catalog")
+        added, skipped = sheet.add_books(enriched_books)
         url = sheet.get_url()
     """
 
-    def __init__(self, sheet_name: str = "Bookshelf Catalog"):
-        """
-        Initialize connection to Google Sheets.
-
-        Args:
-            sheet_name: Name of the Google Spreadsheet to use/create.
-
-        Raises:
-            FileNotFoundError: If token.json is not found.
-            gspread.exceptions.APIError: If auth fails.
-        """
+    def __init__(
+        self,
+        sheet_name: str = "Bookshelf Catalog",
+        token_path: Optional[Path] = None,
+    ) -> None:
         self.sheet_name = sheet_name
-        self._client = None
-        self._spreadsheet = None
-        self._worksheet = None
+        self.token_path = token_path or (HERE / "token.json")
 
-    def _ensure_connected(self) -> None:
-        """Lazily connect to Google Sheets when first needed."""
-        if self._worksheet is not None:
-            return
+        # Lazy-initialized
+        self._client: Optional[gspread.Client] = None
+        self._spreadsheet: Optional[gspread.Spreadsheet] = None
+        self._worksheet: Optional[gspread.Worksheet] = None
 
-        # Load and refresh credentials
-        creds = self._load_credentials()
-
-        # Create gspread client
-        self._client = gspread.authorize(creds)
-
-        # Open or create spreadsheet
-        self._spreadsheet = self._open_or_create_spreadsheet()
-
-        # Open or create worksheet
-        self._worksheet = self._open_or_create_worksheet()
-
-        logger.info(f"Connected to Google Sheets: {self._spreadsheet.url}")
-
-    def _load_credentials(self) -> Credentials:
-        """
-        Load OAuth credentials from token.json.
-
-        Refreshes expired credentials automatically.
-
-        Raises:
-            FileNotFoundError: If token.json doesn't exist.
-        """
-        if not TOKEN_PATH.exists():
-            raise FileNotFoundError(
-                f"token.json not found at {TOKEN_PATH}.\n"
-                "Please run: python bookshelf/oauth_setup.py"
-            )
-
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-
-        # Refresh if expired
-        if creds.expired and creds.refresh_token:
-            logger.info("Refreshing expired Google credentials...")
-            creds.refresh(Request())
-
-            # Save refreshed credentials
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-            logger.info("Credentials refreshed and saved.")
-
-        return creds
-
-    def _open_or_create_spreadsheet(self) -> gspread.Spreadsheet:
-        """Open existing spreadsheet by name, or create a new one."""
-        try:
-            spreadsheet = self._client.open(self.sheet_name)
-            logger.info(f"Opened existing spreadsheet: {self.sheet_name}")
-            return spreadsheet
-        except gspread.SpreadsheetNotFound:
-            logger.info(f"Creating new spreadsheet: {self.sheet_name}")
-            spreadsheet = self._client.create(self.sheet_name)
-            return spreadsheet
-
-    def _open_or_create_worksheet(self) -> gspread.Worksheet:
-        """Open or create the 'Books' worksheet with correct headers."""
-        try:
-            ws = self._spreadsheet.worksheet("Books")
-            logger.info("Found existing 'Books' worksheet")
-        except gspread.WorksheetNotFound:
-            logger.info("Creating 'Books' worksheet")
-            ws = self._spreadsheet.add_worksheet(title="Books", rows=1000, cols=len(SHEET_HEADERS))
-            # Delete default 'Sheet1' if it exists
-            try:
-                sheet1 = self._spreadsheet.worksheet("Sheet1")
-                self._spreadsheet.del_worksheet(sheet1)
-            except gspread.WorksheetNotFound:
-                pass
-
-        # Ensure headers are correct
-        existing_values = ws.row_values(1) if ws.row_count > 0 else []
-        if existing_values != SHEET_HEADERS:
-            if not existing_values:
-                # Empty sheet — add headers
-                ws.append_row(SHEET_HEADERS, value_input_option="RAW")
-                logger.info("Added headers to worksheet")
-            else:
-                # Existing data — headers might be wrong, but don't overwrite
-                logger.warning(f"Unexpected headers: {existing_values}")
-
-        return ws
-
-    def get_url(self) -> str:
-        """Get the URL of the spreadsheet."""
-        self._ensure_connected()
-        return self._spreadsheet.url
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     def add_books(self, books: list[dict]) -> tuple[list[dict], list[dict]]:
         """
-        Add books to the catalog, skipping duplicates.
+        Add books to the spreadsheet, skipping duplicates.
 
         Args:
-            books: List of book dicts with keys matching SHEET_HEADERS.
-                   'Date Added' is set automatically.
+            books: List of enriched book dicts with keys:
+                   Title, Author, Year, ISBN, Genre, Pages, Cover URL
 
         Returns:
-            Tuple of (added_books, skipped_books).
+            (added, skipped) — two lists of book dicts
         """
-        if not books:
-            return [], []
-
-        self._ensure_connected()
-
-        # Load existing books for deduplication
-        existing_keys = self._load_existing_keys()
-        logger.info(f"Existing books in catalog: {len(existing_keys)}")
+        worksheet = self._get_worksheet()
+        existing = self._get_existing_keys(worksheet)
 
         added = []
         skipped = []
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
         rows_to_append = []
+        date_added = _now_str()
 
         for book in books:
-            # Build deduplication key
-            key = self._book_key(book)
+            key = _dedup_key(book)
 
-            if key in existing_keys:
-                logger.info(f"Duplicate: {book.get('Title', '?')}")
+            if key in existing:
+                logger.info(f"Skipping duplicate: {book.get('Title', '?')}")
                 skipped.append(book)
                 continue
 
-            # Build the row
             row = [
                 book.get("Title", ""),
                 book.get("Author", ""),
@@ -210,77 +106,169 @@ class BookshelfSheet:
                 book.get("Genre", ""),
                 book.get("Pages", ""),
                 book.get("Cover URL", ""),
-                today,
+                date_added,
             ]
             rows_to_append.append(row)
-            existing_keys.add(key)  # Prevent duplicates within same batch
+            existing.add(key)  # Prevent duplicates within the same batch
             added.append(book)
 
-        # Batch append all new rows at once
         if rows_to_append:
-            self._worksheet.append_rows(rows_to_append, value_input_option="RAW")
-            logger.info(f"Added {len(rows_to_append)} books to catalog")
+            worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+            logger.info(f"Appended {len(rows_to_append)} rows to spreadsheet")
 
         return added, skipped
 
-    def _load_existing_keys(self) -> set[str]:
-        """
-        Load all existing books and build a set of deduplication keys.
+    def get_url(self) -> str:
+        """Return the URL of the spreadsheet."""
+        spreadsheet = self._get_spreadsheet()
+        return spreadsheet.url
 
-        Keys are: normalized_isbn OR normalized_title+author.
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _get_client(self) -> gspread.Client:
+        """Get an authenticated gspread client."""
+        if self._client is not None:
+            return self._client
+
+        creds = self._load_credentials()
+        self._client = gspread.authorize(creds)
+        return self._client
+
+    def _load_credentials(self) -> Credentials:
         """
-        all_records = self._worksheet.get_all_records()
+        Load OAuth credentials from token.json.
+
+        Refreshes the access token if expired.
+        Raises FileNotFoundError if token.json is missing.
+        """
+        if not self.token_path.exists():
+            raise FileNotFoundError(
+                f"token.json not found at {self.token_path}. "
+                "Run: python bookshelf/oauth_setup.py"
+            )
+
+        creds = Credentials.from_authorized_user_file(str(self.token_path), SCOPES)
+
+        # Refresh if expired
+        if creds.expired and creds.refresh_token:
+            logger.info("Refreshing Google OAuth token...")
+            creds.refresh(Request())
+            # Save refreshed token
+            with open(self.token_path, "w") as f:
+                f.write(creds.to_json())
+            logger.info("Token refreshed and saved")
+
+        return creds
+
+    def _get_spreadsheet(self) -> gspread.Spreadsheet:
+        """Get the spreadsheet, creating it if it doesn't exist."""
+        if self._spreadsheet is not None:
+            return self._spreadsheet
+
+        client = self._get_client()
+
+        try:
+            self._spreadsheet = client.open(self.sheet_name)
+            logger.info(f"Opened existing spreadsheet: '{self.sheet_name}'")
+        except gspread.SpreadsheetNotFound:
+            logger.info(f"Creating new spreadsheet: '{self.sheet_name}'")
+            self._spreadsheet = client.create(self.sheet_name)
+            logger.info(f"Created spreadsheet: {self._spreadsheet.url}")
+
+        return self._spreadsheet
+
+    def _get_worksheet(self) -> gspread.Worksheet:
+        """Get the first worksheet, initializing headers if empty."""
+        if self._worksheet is not None:
+            return self._worksheet
+
+        spreadsheet = self._get_spreadsheet()
+        self._worksheet = spreadsheet.sheet1
+
+        # Initialize headers if the sheet is empty
+        first_row = self._worksheet.row_values(1)
+        if not first_row:
+            logger.info("Initializing spreadsheet headers")
+            self._worksheet.update([HEADERS], "A1")
+            logger.info(f"Headers written: {HEADERS}")
+
+        return self._worksheet
+
+    def _get_existing_keys(self, worksheet: gspread.Worksheet) -> set[str]:
+        """
+        Get a set of deduplication keys for all existing books.
+
+        Reads all rows and builds keys from ISBN (or Title+Author).
+        """
+        all_values = worksheet.get_all_values()
+
+        if len(all_values) <= 1:
+            # Only header row (or empty)
+            return set()
+
+        # Find column indices
+        header_row = all_values[0]
+        col_idx = {name: i for i, name in enumerate(header_row)}
+
+        title_col = col_idx.get("Title", 0)
+        author_col = col_idx.get("Author", 1)
+        isbn_col = col_idx.get("ISBN", 3)
+
         keys = set()
+        for row in all_values[1:]:
+            if not row or not any(row):
+                continue
 
-        for record in all_records:
-            key = self._book_key(record)
+            isbn = row[isbn_col].strip() if isbn_col < len(row) else ""
+            title = row[title_col].strip() if title_col < len(row) else ""
+            author = row[author_col].strip() if author_col < len(row) else ""
+
+            key = _make_key(isbn=isbn, title=title, author=author)
             if key:
                 keys.add(key)
 
+        logger.debug(f"Found {len(keys)} existing books in spreadsheet")
         return keys
-
-    def _book_key(self, book: dict) -> str:
-        """
-        Build a deduplication key for a book.
-
-        Priority:
-        1. ISBN (if available and non-empty) — most reliable
-        2. normalized(title) + "|" + normalized(author)
-        """
-        isbn = str(book.get("ISBN", "")).strip()
-        if isbn and isbn not in ("", "None"):
-            return f"isbn:{isbn}"
-
-        title = _normalize_text(book.get("Title", ""))
-        author = _normalize_text(book.get("Author", ""))
-
-        if title:
-            return f"book:{title}|{author}"
-
-        return ""
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
-def _normalize_text(text: str) -> str:
-    """
-    Normalize text for deduplication comparison.
+def _dedup_key(book: dict) -> str:
+    """Create a deduplication key for a book dict."""
+    return _make_key(
+        isbn=book.get("ISBN", ""),
+        title=book.get("Title", ""),
+        author=book.get("Author", ""),
+    )
 
-    Lowercase, strip whitespace, remove common articles.
+
+def _make_key(isbn: str, title: str, author: str) -> str:
     """
-    if not text:
+    Create a normalized deduplication key.
+
+    Strategy:
+    - If ISBN is available: use it (most reliable)
+    - Otherwise: use normalized "title|author"
+    """
+    isbn = isbn.strip()
+    if isbn:
+        return f"isbn:{isbn}"
+
+    # Fallback: normalized title + author
+    title_norm = _normalize(title)
+    author_norm = _normalize(author)
+
+    if not title_norm:
         return ""
 
-    # Lowercase and strip
-    normalized = str(text).lower().strip()
+    return f"title:{title_norm}|author:{author_norm}"
 
-    # Remove leading articles for better matching
-    for article in ("the ", "a ", "an ", "the\t"):
-        if normalized.startswith(article):
-            normalized = normalized[len(article):]
-            break
 
-    # Collapse multiple spaces
-    normalized = " ".join(normalized.split())
+def _normalize(text: str) -> str:
+    """Lowercase, strip extra whitespace."""
+    return " ".join(str(text).lower().split())
 
-    return normalized
+
+def _now_str() -> str:
+    """Return current UTC date as YYYY-MM-DD string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
