@@ -1,147 +1,117 @@
 """
-sheets.py — Google Sheets integration for Bookshelf Catalog
+sheets.py — Сохраняет каталог книг как CSV прямо в Google Drive.
 
-Использует credentials из уже подключённого Google Drive в Colab.
-Никакой дополнительной авторизации не нужно — Drive уже смонтирован.
+Никакого Google Cloud проекта не нужно — файл пишется напрямую
+через смонтированный Drive (/content/drive/MyDrive/).
 
-Структура таблицы:
-    Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added
+Открыть в Google Sheets: просто кликни на файл в Drive.
 """
 
+import csv
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-import google.auth
-import gspread
-from dotenv import load_dotenv
-
-HERE = Path(__file__).parent
-load_dotenv(HERE / ".env")
-
 logger = logging.getLogger(__name__)
 
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Bookshelf Catalog")
-WORKSHEET_NAME = "Books"
-COLUMNS = ["Title", "Author", "Year", "ISBN", "Genre", "Pages", "Cover URL", "Date Added"]
+CSV_COLUMNS = ["Title", "Author", "Year", "ISBN", "Genre", "Pages", "Added_At"]
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-
-def _get_client() -> gspread.Client:
-    """
-    Авторизоваться через уже подключённый Colab/Drive аккаунт.
-    Никаких credentials.json, token.json или Google Cloud проекта не нужно.
-    """
-    creds, _ = google.auth.default(scopes=SCOPES)
-    return gspread.authorize(creds)
+DEFAULT_PATH = "/content/drive/MyDrive/Bookshelf Catalog.csv"
 
 
 class BookshelfSheet:
-    """
-    Интерфейс к Google Sheets каталогу.
+    def __init__(self, path: str = DEFAULT_PATH):
+        self.path = Path(path)
 
-    Таблица создаётся в Drive аккаунте, который подключён к Colab.
-    """
+    def _ensure_file(self) -> None:
+        """Создаёт CSV файл с заголовками если не существует."""
+        if not self.path.parent.exists():
+            raise RuntimeError(
+                f"Google Drive не смонтирован или путь недоступен: {self.path.parent}\n"
+                "Убедись что Drive смонтирован в Colab."
+            )
+        if not self.path.exists():
+            with self.path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+            logger.info(f"Created new catalog: {self.path}")
 
-    def __init__(self):
-        self._client: gspread.Client | None = None
-        self._spreadsheet: gspread.Spreadsheet | None = None
-        self._worksheet: gspread.Worksheet | None = None
+    def _load_existing(self) -> list[dict]:
+        """Загружает существующие книги из CSV."""
+        if not self.path.exists():
+            return []
+        with self.path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+
+    def _is_duplicate(self, book: dict, existing: list[dict]) -> bool:
+        """Проверяет дубликат по ISBN или Title+Author."""
+        isbn = (book.get("ISBN") or "").strip()
+        title = (book.get("Title") or "").strip().lower()
+        author = (book.get("Author") or "").strip().lower()
+
+        for row in existing:
+            row_isbn = (row.get("ISBN") or "").strip()
+            row_title = (row.get("Title") or "").strip().lower()
+            row_author = (row.get("Author") or "").strip().lower()
+
+            # Дубликат по ISBN (если оба не пустые)
+            if isbn and row_isbn and isbn == row_isbn:
+                return True
+            # Дубликат по Title + Author
+            if title and author and title == row_title and author == row_author:
+                return True
+        return False
 
     def add_books(self, books: list[dict]) -> tuple[list[dict], list[dict]]:
-        """Добавить книги в каталог, пропуская дубликаты."""
-        ws = self._get_worksheet()
-        existing_keys = self._get_existing_keys(ws)
+        """
+        Добавляет книги в CSV, пропуская дубликаты.
 
-        added, skipped, rows_to_append = [], [], []
+        Returns:
+            (added, skipped) — списки добавленных и пропущенных книг
+        """
+        self._ensure_file()
+        existing = self._load_existing()
 
+        added = []
+        skipped = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        new_rows = []
         for book in books:
-            key = _dedup_key(book)
-            if key in existing_keys:
+            if self._is_duplicate(book, existing + new_rows):
                 skipped.append(book)
             else:
-                added.append(book)
-                rows_to_append.append(_book_to_row(book))
-                existing_keys.add(key)
+                row = {col: book.get(col, "") for col in CSV_COLUMNS}
+                row["Added_At"] = now
+                new_rows.append(row)
+                added.append(row)
 
-        if rows_to_append:
-            ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-            logger.info(f"Added {len(added)} book(s) to sheet")
+        if new_rows:
+            with self.path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writerows(new_rows)
+            logger.info(f"Added {len(new_rows)} books to {self.path}")
 
         return added, skipped
 
     def get_url(self) -> str:
-        return self._get_spreadsheet().url
-
-    def _get_client(self) -> gspread.Client:
-        if self._client is None:
-            self._client = _get_client()
-        return self._client
-
-    def _get_spreadsheet(self) -> gspread.Spreadsheet:
-        if self._spreadsheet is not None:
-            return self._spreadsheet
-
-        client = self._get_client()
-        try:
-            self._spreadsheet = client.open(SHEET_NAME)
-        except gspread.SpreadsheetNotFound:
-            self._spreadsheet = client.create(SHEET_NAME)
-            logger.info(f"Created new spreadsheet: {SHEET_NAME!r}")
-
-        return self._spreadsheet
-
-    def _get_worksheet(self) -> gspread.Worksheet:
-        if self._worksheet is not None:
-            return self._worksheet
-
-        spreadsheet = self._get_spreadsheet()
-        try:
-            ws = spreadsheet.worksheet(WORKSHEET_NAME)
-            if ws.row_values(1) != COLUMNS:
-                ws.update("A1", [COLUMNS])
-        except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(WORKSHEET_NAME, rows=1000, cols=len(COLUMNS))
-            ws.append_row(COLUMNS)
+        """Возвращает информацию о расположении файла."""
+        exists = self.path.exists()
+        if exists:
             try:
-                spreadsheet.del_worksheet(spreadsheet.worksheet("Sheet1"))
-            except gspread.WorksheetNotFound:
+                existing = self._load_existing()
+                count = len(existing)
+                return (
+                    f"📁 <b>Файл:</b> <code>{self.path}</code>\n"
+                    f"📚 Книг в каталоге: <b>{count}</b>\n\n"
+                    "Открой Google Drive на компьютере — файл "
+                    "<b>Bookshelf Catalog.csv</b> там уже есть.\n"
+                    "Кликни на него → откроется в Google Sheets."
+                )
+            except Exception:
                 pass
-
-        self._worksheet = ws
-        return ws
-
-    def _get_existing_keys(self, ws: gspread.Worksheet) -> set[str]:
-        try:
-            return {_dedup_key(r) for r in ws.get_all_records() if _dedup_key(r)}
-        except Exception as e:
-            logger.warning(f"Could not read existing records: {e}")
-            return set()
-
-
-def _dedup_key(book: dict) -> str:
-    isbn = str(book.get("ISBN", "")).strip()
-    if isbn:
-        return f"isbn:{isbn}"
-    title = str(book.get("Title", "")).lower().strip()
-    author = str(book.get("Author", "")).lower().strip()
-    return f"ta:{title}|{author}" if title else ""
-
-
-def _book_to_row(book: dict) -> list[str]:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return [
-        book.get("Title", ""),
-        book.get("Author", ""),
-        book.get("Year", ""),
-        book.get("ISBN", ""),
-        book.get("Genre", ""),
-        book.get("Pages", ""),
-        book.get("Cover URL", ""),
-        now,
-    ]
+        return (
+            f"📁 Каталог будет создан по пути:\n<code>{self.path}</code>\n\n"
+            "Отправь первое фото полки чтобы начать!"
+        )
