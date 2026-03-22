@@ -1,109 +1,106 @@
+#!/usr/bin/env python3
 """
-oauth_setup.py — One-time Google OAuth authorization
+oauth_setup.py — First-time Google OAuth 2.0 authorization
 
-Run this script ONCE to authorize the bot to access your Google Sheets.
-It will open a browser window asking you to log in with your Google account.
-After authorization, a token.json file will be saved in bookshelf/.
+Run this ONCE to authorize the bot to access your Google Sheets.
+This will open a browser window where you log in with your Google account.
+After authorization, a token.json file is saved for future use.
 
 Usage:
     python bookshelf/oauth_setup.py
 
-Prerequisites:
-    1. Create a Google Cloud project (see bookshelf/README.md)
-    2. Enable Google Sheets API and Google Drive API
-    3. Create OAuth 2.0 credentials (Desktop application)
-    4. Download credentials.json to bookshelf/credentials.json
-    5. Run this script
+Requirements:
+    - credentials.json must exist in bookshelf/ directory
+      (downloaded from Google Cloud Console)
+    - Run on a machine with a browser available (or use the printed URL)
+
+The bot will be able to:
+    - Create and edit Google Sheets in YOUR Google account
+    - No card required, no billing — just free Google account
 """
 
+import json
 import sys
 from pathlib import Path
 
-# Ensure imports work from any working directory
-sys.path.insert(0, str(Path(__file__).parent))
-
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
-
-BOOKSHELF_DIR = Path(__file__).parent
-CREDENTIALS_FILE = BOOKSHELF_DIR / "credentials.json"
-TOKEN_FILE = BOOKSHELF_DIR / "token.json"
+# Ensure we can find the .env in bookshelf/
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 
 def main():
     print("=" * 60)
     print("Bookshelf Catalog — Google OAuth Setup")
     print("=" * 60)
-    print()
 
-    # Check prerequisites
-    if not CREDENTIALS_FILE.exists():
-        print("❌ ERROR: credentials.json not found!")
-        print()
-        print("Steps to fix:")
-        print("1. Go to: https://console.cloud.google.com/")
-        print("2. Create a project (or select existing)")
-        print("3. Enable APIs: Sheets API + Drive API")
-        print("4. Create credentials: APIs & Services → Credentials")
-        print("   → Create Credentials → OAuth Client ID")
-        print("   → Application type: Desktop app")
+    # Check for credentials.json
+    credentials_path = Path(__file__).parent / "credentials.json"
+    token_path = Path(__file__).parent / "token.json"
+
+    if not credentials_path.exists():
+        print("\n❌ credentials.json not found!")
+        print("\nTo create it:")
+        print("1. Go to https://console.cloud.google.com/")
+        print("2. Create a new project (or select existing)")
+        print("3. Enable 'Google Sheets API' and 'Google Drive API'")
+        print("   → APIs & Services → Enable APIs → search 'Sheets'")
+        print("4. Create OAuth credentials:")
+        print("   → APIs & Services → Credentials → Create Credentials")
+        print("   → OAuth 2.0 Client ID → Desktop App")
         print("5. Download JSON → rename to credentials.json")
-        print(f"6. Place in: {CREDENTIALS_FILE}")
-        print()
+        print(f"6. Place it here: {credentials_path}")
+        print("\n💡 Note: Google Cloud free tier is sufficient — no billing required!")
         sys.exit(1)
 
-    print(f"✅ Found credentials.json")
+    if token_path.exists():
+        print(f"\n⚠️  token.json already exists at {token_path}")
+        answer = input("Re-authorize? This will replace the existing token. [y/N]: ").strip().lower()
+        if answer != "y":
+            print("Aborted. Existing token.json kept.")
+            sys.exit(0)
 
-    # Check if token already exists
-    if TOKEN_FILE.exists():
-        try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
-            if creds.valid:
-                print("✅ token.json already exists and is valid!")
-                print()
-                print("You're all set. You can run the bot:")
-                print("  python bookshelf/bot.py")
-                return
-            elif creds.expired and creds.refresh_token:
-                print("🔄 Token expired, refreshing...")
-                creds.refresh(Request())
-                with open(TOKEN_FILE, "w") as f:
-                    f.write(creds.to_json())
-                print("✅ Token refreshed successfully!")
-                print()
-                print("You can now run the bot:")
-                print("  python bookshelf/bot.py")
-                return
-        except Exception as e:
-            print(f"⚠️  Existing token.json is invalid ({e}), re-authorizing...")
+    # Perform OAuth flow
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        print("\n❌ Missing dependency: google-auth-oauthlib")
+        print("Run: pip install google-auth-oauthlib")
+        sys.exit(1)
 
-    # Run OAuth flow
-    print()
-    print("🌐 Opening browser for Google authorization...")
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+
+    print("\n🌐 Opening browser for Google authorization...")
     print("   (If browser doesn't open, check the URL printed below)")
     print()
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-    creds = flow.run_local_server(port=0)
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(credentials_path),
+            scopes=SCOPES,
+        )
+        creds = flow.run_local_server(
+            port=0,
+            prompt="consent",
+            access_type="offline",
+        )
+    except Exception as e:
+        print(f"\n❌ Authorization failed: {e}")
+        print("\nIf you're on a headless server, use:")
+        print("    flow.run_console()  # instead of run_local_server")
+        sys.exit(1)
 
     # Save token
-    with open(TOKEN_FILE, "w") as f:
+    with open(token_path, "w") as f:
         f.write(creds.to_json())
 
+    print(f"\n✅ Authorization successful!")
+    print(f"   Token saved to: {token_path}")
     print()
-    print(f"✅ Authorization successful!")
-    print(f"✅ Token saved to: {TOKEN_FILE}")
-    print()
-    print("You can now run the bot:")
-    print("  python bookshelf/bot.py")
-    print()
-    print("Note: token.json is in .gitignore — it will NOT be committed to git.")
+    print("You can now start the bot:")
+    print("    python bookshelf/bot.py")
 
 
 if __name__ == "__main__":
