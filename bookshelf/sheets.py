@@ -1,15 +1,14 @@
 """
-Google Sheets module: append book catalog entries using OAuth credentials.
+Google Sheets module: append book catalog entries using Colab credentials.
 
-Creates the sheet if it doesn't exist. Appends rows on each new photo.
-Handles duplicate sheet names gracefully.
+Uses google.auth.default() — works automatically when running in Google Colab
+where Drive is already mounted. No separate OAuth setup needed.
 """
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 import gspread
-from google.oauth2.credentials import Credentials
+from google.auth import default as google_auth_default
 from google.auth.transport.requests import Request
 
 logger = logging.getLogger(__name__)
@@ -21,86 +20,73 @@ SCOPES = [
 
 # Column order in the spreadsheet
 COLUMNS = [
-    "Date Added",         # When the photo was processed
-    "Title (VLM)",        # Title as read by AI
-    "Author (VLM)",       # Author as read by AI
-    "Title (Confirmed)",  # Title from Google Books
-    "Author (Confirmed)", # Author from Google Books
-    "Year",               # Publication year
-    "ISBN",               # ISBN-13 or ISBN-10
-    "Categories",         # Book genres/categories
-    "Language",           # Book language code (en, ru, etc.)
-    "Pages",              # Page count
-    "Description",        # Short description
-    "Google Books Link",  # Link to Google Books entry
+    "Date Added",           # When the photo was processed
+    "Title (VLM)",          # Title as read by AI
+    "Author (VLM)",         # Author as read by AI
+    "Title (Confirmed)",    # Title from Google Books
+    "Author (Confirmed)",   # Author from Google Books
+    "Year",                 # Publication year
+    "ISBN",                 # ISBN-13 or ISBN-10
+    "Categories",           # Book genres/categories
+    "Language",             # Language code (en, ru, etc.)
+    "Pages",                # Page count
+    "Description",          # Short description
+    "Google Books Link",    # Link to Google Books entry
 ]
 
 
-def _load_credentials(token_path: str) -> Credentials:
-    """Load and refresh OAuth credentials from token.json."""
-    path = Path(token_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Google token not found at {token_path}. "
-            "Run 'python auth_google.py' to authenticate."
-        )
+def _get_client() -> gspread.Client:
+    """
+    Get authenticated gspread client using Colab's built-in credentials.
 
-    creds = Credentials.from_authorized_user_file(str(path), SCOPES)
-
-    # Refresh if expired
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            logger.info("Refreshing expired Google OAuth token...")
+    In Colab, google.auth.default() returns the credentials of the Google
+    account that mounted Google Drive — no extra setup required.
+    """
+    try:
+        creds, project = google_auth_default(scopes=SCOPES)
+        # Refresh if needed
+        if not creds.valid:
             creds.refresh(Request())
-            # Save refreshed token
-            path.write_text(creds.to_json())
-            logger.info("Token refreshed and saved.")
-        else:
-            raise RuntimeError(
-                "Google credentials are invalid and cannot be refreshed. "
-                "Run 'python auth_google.py' to re-authenticate."
-            )
-
-    return creds
+        return gspread.authorize(creds)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not get Google credentials: {e}\n\n"
+            "Make sure you're running this in Google Colab with Drive mounted.\n"
+            "Run this in a Colab cell first:\n"
+            "  from google.colab import drive\n"
+            "  drive.mount('/content/drive')"
+        ) from e
 
 
 def _get_or_create_sheet(client: gspread.Client, sheet_name: str) -> gspread.Spreadsheet:
     """Get existing spreadsheet by name or create a new one."""
     try:
         spreadsheet = client.open(sheet_name)
-        logger.info(f"Found existing spreadsheet: {sheet_name}")
+        logger.info(f"Found existing spreadsheet: '{sheet_name}'")
         return spreadsheet
     except gspread.SpreadsheetNotFound:
-        logger.info(f"Creating new spreadsheet: {sheet_name}")
+        logger.info(f"Creating new spreadsheet: '{sheet_name}'")
         spreadsheet = client.create(sheet_name)
-        # Make it accessible (optional: share with yourself)
-        # spreadsheet.share(your_email, perm_type='user', role='writer')
         return spreadsheet
 
 
 def _ensure_header(worksheet: gspread.Worksheet) -> None:
     """Add header row if the sheet is empty."""
-    all_values = worksheet.get_all_values()
-    if not all_values:
+    existing = worksheet.get_all_values()
+    if not existing:
         worksheet.append_row(COLUMNS, value_input_option="RAW")
-        logger.info("Added header row to sheet.")
-    elif all_values[0] != COLUMNS:
-        # Sheet has data but wrong header — insert header at top
-        logger.warning("Sheet has data but no matching header — skipping header insert.")
+        # Bold the header row
+        worksheet.format("A1:L1", {"textFormat": {"bold": True}})
+        logger.info("Added header row.")
 
 
-def append_books(
-    books: list[dict],
-    sheet_name: str,
-    token_path: str,
-) -> str:
+def append_books(books: list[dict], sheet_name: str, **kwargs) -> str:
     """
     Append enriched book data to a Google Sheet.
 
     Args:
-        books: List of enriched book dicts (from enrich_books)
+        books:      List of enriched book dicts (from books_api.enrich_books)
         sheet_name: Name of the Google Sheet to create/update
-        token_path: Path to OAuth token.json file
 
     Returns:
         URL of the Google Sheet
@@ -109,20 +95,15 @@ def append_books(
         logger.warning("No books to append.")
         return ""
 
-    creds = _load_credentials(token_path)
-    client = gspread.authorize(creds)
-
+    client = _get_client()
     spreadsheet = _get_or_create_sheet(client, sheet_name)
     worksheet = spreadsheet.sheet1
-
     _ensure_header(worksheet)
 
-    # Build rows to append
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows = []
-
     for book in books:
-        row = [
+        rows.append([
             now,
             book.get("title", ""),
             book.get("author", ""),
@@ -135,25 +116,23 @@ def append_books(
             book.get("page_count", ""),
             book.get("description", ""),
             book.get("google_books_link", ""),
-        ]
-        rows.append(row)
+        ])
 
-    # Batch append all rows at once
     worksheet.append_rows(rows, value_input_option="USER_ENTERED")
-    logger.info(f"Appended {len(rows)} rows to '{sheet_name}'")
+    logger.info(f"Appended {len(rows)} rows to '{sheet_name}'.")
 
-    sheet_url = spreadsheet.url
-    logger.info(f"Sheet URL: {sheet_url}")
-    return sheet_url
+    url = spreadsheet.url
+    logger.info(f"Sheet URL: {url}")
+    return url
 
 
-def get_sheet_url(sheet_name: str, token_path: str) -> str:
-    """Get the URL of the catalog sheet without modifying it."""
-    creds = _load_credentials(token_path)
-    client = gspread.authorize(creds)
-
+def get_sheet_url(sheet_name: str, **kwargs) -> str:
+    """Get the URL of the catalog sheet (without modifying it)."""
     try:
-        spreadsheet = client.open(sheet_name)
-        return spreadsheet.url
+        client = _get_client()
+        return client.open(sheet_name).url
     except gspread.SpreadsheetNotFound:
+        return ""
+    except Exception as e:
+        logger.warning(f"Could not get sheet URL: {e}")
         return ""
