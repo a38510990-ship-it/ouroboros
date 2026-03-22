@@ -1,14 +1,14 @@
 """
-Google Sheets module: append book catalog entries using Colab credentials.
+Google Sheets module: append book catalog entries using OAuth credentials.
 
-Uses google.auth.default() — works automatically when running in Google Colab
-where Drive is already mounted. No separate OAuth setup needed.
+Requires token.json (created by oauth_setup.py).
 """
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 import gspread
-from google.auth import default as google_auth_default
+from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
 logger = logging.getLogger(__name__)
@@ -20,42 +20,48 @@ SCOPES = [
 
 # Column order in the spreadsheet
 COLUMNS = [
-    "Date Added",           # When the photo was processed
-    "Title (VLM)",          # Title as read by AI
-    "Author (VLM)",         # Author as read by AI
-    "Title (Confirmed)",    # Title from Google Books
-    "Author (Confirmed)",   # Author from Google Books
-    "Year",                 # Publication year
-    "ISBN",                 # ISBN-13 or ISBN-10
-    "Categories",           # Book genres/categories
-    "Language",             # Language code (en, ru, etc.)
-    "Pages",                # Page count
-    "Description",          # Short description
-    "Google Books Link",    # Link to Google Books entry
+    "Date Added",
+    "Title (VLM)",
+    "Author (VLM)",
+    "Title (Confirmed)",
+    "Author (Confirmed)",
+    "Year",
+    "ISBN",
+    "Categories",
+    "Language",
+    "Pages",
+    "Description",
+    "Google Books Link",
 ]
 
 
-def _get_client() -> gspread.Client:
+def _get_client(token_path: str = "token.json") -> gspread.Client:
     """
-    Get authenticated gspread client using Colab's built-in credentials.
+    Get authenticated gspread client using OAuth token.json.
+    Automatically refreshes expired tokens.
+    """
+    token_file = Path(token_path)
+    if not token_file.exists():
+        raise FileNotFoundError(
+            f"token.json not found at '{token_path}'.\n"
+            "Run `python oauth_setup.py` first to authenticate with Google."
+        )
 
-    In Colab, google.auth.default() returns the credentials of the Google
-    account that mounted Google Drive — no extra setup required.
-    """
-    try:
-        creds, project = google_auth_default(scopes=SCOPES)
-        # Refresh if needed
-        if not creds.valid:
+    creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            logger.info("Refreshing expired Google OAuth token...")
             creds.refresh(Request())
-        return gspread.authorize(creds)
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not get Google credentials: {e}\n\n"
-            "Make sure you're running this in Google Colab with Drive mounted.\n"
-            "Run this in a Colab cell first:\n"
-            "  from google.colab import drive\n"
-            "  drive.mount('/content/drive')"
-        ) from e
+            token_file.write_text(creds.to_json())
+            logger.info("Token refreshed and saved.")
+        else:
+            raise RuntimeError(
+                "Google credentials are invalid and cannot be refreshed.\n"
+                "Run `python oauth_setup.py` again to re-authenticate."
+            )
+
+    return gspread.authorize(creds)
 
 
 def _get_or_create_sheet(client: gspread.Client, sheet_name: str) -> gspread.Spreadsheet:
@@ -75,35 +81,86 @@ def _ensure_header(worksheet: gspread.Worksheet) -> None:
     existing = worksheet.get_all_values()
     if not existing:
         worksheet.append_row(COLUMNS, value_input_option="RAW")
-        # Bold the header row
         worksheet.format("A1:L1", {"textFormat": {"bold": True}})
         logger.info("Added header row.")
 
 
-def append_books(books: list[dict], sheet_name: str, **kwargs) -> str:
+def _get_existing_keys(worksheet: gspread.Worksheet) -> set:
     """
-    Append enriched book data to a Google Sheet.
+    Return a set of deduplication keys from existing rows.
+    Key = lowercase "title_confirmed|authors_confirmed" or "title_vlm|author_vlm".
+    """
+    rows = worksheet.get_all_values()
+    if not rows or len(rows) < 2:
+        return set()
+
+    keys = set()
+    for row in rows[1:]:  # skip header
+        if len(row) < 5:
+            continue
+        title_confirmed = row[3].strip().lower()
+        author_confirmed = row[4].strip().lower()
+        title_vlm = row[1].strip().lower()
+        author_vlm = row[2].strip().lower()
+
+        if title_confirmed:
+            keys.add(f"{title_confirmed}|{author_confirmed}")
+        elif title_vlm:
+            keys.add(f"{title_vlm}|{author_vlm}")
+
+    return keys
+
+
+def _book_key(book: dict) -> str:
+    """Compute deduplication key for a book dict."""
+    title = (book.get("title_confirmed") or book.get("title", "")).strip().lower()
+    author = (book.get("authors_confirmed") or book.get("author", "")).strip().lower()
+    return f"{title}|{author}"
+
+
+def append_books(
+    books: list,
+    sheet_name: str,
+    token_path: str = "token.json",
+    **kwargs,
+) -> tuple:
+    """
+    Append enriched book data to a Google Sheet, with deduplication.
 
     Args:
         books:      List of enriched book dicts (from books_api.enrich_books)
         sheet_name: Name of the Google Sheet to create/update
+        token_path: Path to token.json
 
     Returns:
-        URL of the Google Sheet
+        Tuple of (sheet_url: str, added_count: int, skipped_count: int)
     """
     if not books:
         logger.warning("No books to append.")
-        return ""
+        return "", 0, 0
 
-    client = _get_client()
+    client = _get_client(token_path)
     spreadsheet = _get_or_create_sheet(client, sheet_name)
     worksheet = spreadsheet.sheet1
     _ensure_header(worksheet)
 
+    # Get existing keys for deduplication
+    existing_keys = _get_existing_keys(worksheet)
+    logger.info(f"Found {len(existing_keys)} existing books in sheet (for dedup).")
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    rows = []
+    rows_to_add = []
+    skipped_count = 0
+
     for book in books:
-        rows.append([
+        key = _book_key(book)
+        if key in existing_keys:
+            title = book.get("title_confirmed") or book.get("title", "?")
+            logger.info(f"Skipping duplicate: {title}")
+            skipped_count += 1
+            continue
+
+        rows_to_add.append([
             now,
             book.get("title", ""),
             book.get("author", ""),
@@ -117,21 +174,26 @@ def append_books(books: list[dict], sheet_name: str, **kwargs) -> str:
             book.get("description", ""),
             book.get("google_books_link", ""),
         ])
+        existing_keys.add(key)  # prevent duplicates within this batch
 
-    worksheet.append_rows(rows, value_input_option="USER_ENTERED")
-    logger.info(f"Appended {len(rows)} rows to '{sheet_name}'.")
+    if rows_to_add:
+        worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        logger.info(f"Appended {len(rows_to_add)} rows to '{sheet_name}'.")
+    else:
+        logger.info("All books were duplicates — nothing added.")
 
     url = spreadsheet.url
-    logger.info(f"Sheet URL: {url}")
-    return url
+    return url, len(rows_to_add), skipped_count
 
 
-def get_sheet_url(sheet_name: str, **kwargs) -> str:
+def get_sheet_url(sheet_name: str, token_path: str = "token.json", **kwargs) -> str:
     """Get the URL of the catalog sheet (without modifying it)."""
     try:
-        client = _get_client()
+        client = _get_client(token_path)
         return client.open(sheet_name).url
     except gspread.SpreadsheetNotFound:
+        return ""
+    except FileNotFoundError:
         return ""
     except Exception as e:
         logger.warning(f"Could not get sheet URL: {e}")
