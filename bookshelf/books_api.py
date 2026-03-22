@@ -1,167 +1,171 @@
 """
-Google Books API module: enrich book titles with metadata.
+books_api.py — Google Books API enrichment
 
-Uses the free Google Books API (no API key required for basic queries).
+Takes a list of {title, author} dicts from VLM and enriches them
+with metadata from the Google Books API (free, no key required).
+
+Output format: {Title, Author, Year, ISBN, Genre, Pages, Cover URL}
 """
+
+import asyncio
 import logging
-import time
-from urllib.parse import quote_plus
+import urllib.parse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
-REQUEST_DELAY = 0.3  # seconds between requests (rate limiting)
+GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
+REQUEST_TIMEOUT = 10.0
+MAX_CONCURRENT = 5  # Parallel requests to Google Books API
 
 
-def enrich_books(books: list[dict]) -> list[dict]:
+async def enrich_books(raw_books: list[dict]) -> list[dict]:
     """
-    Enrich a list of raw books with metadata from Google Books API.
+    Enrich a list of {title, author} dicts with Google Books metadata.
 
     Args:
-        books: List of {title, author} dicts from VLM
+        raw_books: list of dicts with 'title' and 'author' keys
 
     Returns:
-        List of enriched dicts with additional metadata fields.
+        list of enriched book dicts with all catalog fields
     """
-    enriched = []
-    total = len(books)
+    if not raw_books:
+        return []
 
-    with httpx.Client(timeout=10.0) as client:
-        for i, book in enumerate(books):
-            logger.info(f"Enriching book {i+1}/{total}: {book.get('title', '?')}")
+    # Use semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
+    async def enrich_one(book: dict) -> dict:
+        async with semaphore:
+            return await _fetch_book_metadata(
+                title=book.get("title", ""),
+                author=book.get("author", ""),
+            )
+
+    results = await asyncio.gather(*[enrich_one(b) for b in raw_books])
+    return list(results)
+
+
+async def _fetch_book_metadata(title: str, author: str) -> dict:
+    """
+    Query Google Books API for a single book.
+
+    Tries two queries:
+    1. title + author (if author available)
+    2. title only (fallback)
+    """
+    base_result = {
+        "Title": title,
+        "Author": author,
+        "Year": "",
+        "ISBN": "",
+        "Genre": "",
+        "Pages": "",
+        "Cover URL": "",
+    }
+
+    if not title:
+        return base_result
+
+    queries = []
+    if author:
+        queries.append(f'intitle:{title} inauthor:{author}')
+    queries.append(f'intitle:{title}')
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for query in queries:
             try:
-                metadata = _fetch_book_metadata(client, book)
-                enriched_book = {**book, **metadata}
-                enriched.append(enriched_book)
+                params = {
+                    "q": query,
+                    "maxResults": 1,
+                    "printType": "books",
+                    "langRestrict": "",  # any language
+                }
+                response = await client.get(GOOGLE_BOOKS_API, params=params)
+
+                if response.status_code != 200:
+                    logger.warning(f"Google Books API error {response.status_code} for: {title}")
+                    continue
+
+                data = response.json()
+                items = data.get("items", [])
+
+                if not items:
+                    logger.debug(f"No results for query: {query}")
+                    continue
+
+                # Parse first result
+                enriched = _parse_volume(items[0], base_result)
+                logger.info(f"Enriched: {title!r} → {enriched['Title']!r} by {enriched['Author']!r}")
+                return enriched
+
+            except httpx.TimeoutException:
+                logger.warning(f"Timeout fetching metadata for: {title}")
             except Exception as e:
-                logger.warning(f"Failed to enrich '{book.get('title')}': {e}")
-                # Still include the book, just without extra metadata
-                enriched.append({
-                    **book,
-                    "title_confirmed": "",
-                    "authors_confirmed": "",
-                    "year": "",
-                    "isbn": "",
-                    "categories": "",
-                    "language": "",
-                    "page_count": "",
-                    "description": "",
-                    "google_books_link": "",
-                })
+                logger.warning(f"Error fetching metadata for {title!r}: {e}")
 
-            if i < total - 1:
-                time.sleep(REQUEST_DELAY)
-
-    logger.info(f"Enriched {len(enriched)}/{total} books")
-    return enriched
+    # Return base result if all queries failed
+    logger.info(f"No metadata found for: {title!r}")
+    return base_result
 
 
-def _build_query(book: dict) -> str:
-    """Build a Google Books search query from book data."""
-    title = book.get("title", "").strip()
-    author = book.get("author", "").strip()
-
-    if author and author.lower() != "unknown":
-        query = f'intitle:"{title}" inauthor:"{author}"'
-    else:
-        query = f'intitle:"{title}"'
-
-    return query
-
-
-def _fetch_book_metadata(client: httpx.Client, book: dict) -> dict:
+def _parse_volume(item: dict, fallback: dict) -> dict:
     """
-    Query Google Books API and extract metadata for a single book.
-
-    Returns dict with metadata fields (empty strings if not found).
+    Parse a Google Books API volume item into our catalog format.
     """
-    query = _build_query(book)
+    info = item.get("volumeInfo", {})
 
-    params = {
-        "q": query,
-        "maxResults": 3,
-        "orderBy": "relevance",
-        "langRestrict": "",  # any language
-        "printType": "books",
-    }
+    # Title
+    title = info.get("title", fallback["Title"])
+    subtitle = info.get("subtitle", "")
+    if subtitle:
+        title = f"{title}: {subtitle}"
 
-    response = client.get(GOOGLE_BOOKS_URL, params=params)
-    response.raise_for_status()
+    # Author(s)
+    authors = info.get("authors", [])
+    author = ", ".join(authors) if authors else fallback["Author"]
 
-    data = response.json()
-    total = data.get("totalItems", 0)
-    items = data.get("items", [])
+    # Year (from publishedDate like "2001-09-11" or "2001")
+    published = info.get("publishedDate", "")
+    year = published[:4] if published else ""
 
-    if not items:
-        # Try a simpler query (just title, no quotes)
-        fallback_query = quote_plus(book.get("title", ""))
-        params["q"] = book.get("title", "")
-        response = client.get(GOOGLE_BOOKS_URL, params=params)
-        data = response.json()
-        items = data.get("items", [])
-
-    if not items:
-        logger.debug(f"No results for: {book.get('title')}")
-        return _empty_metadata()
-
-    # Take the best match (first result)
-    volume_info = items[0].get("volumeInfo", {})
-    sale_info = items[0].get("saleInfo", {})
-    book_id = items[0].get("id", "")
-
-    # Extract ISBN
+    # ISBN (prefer ISBN-13)
     isbn = ""
-    for identifier in volume_info.get("industryIdentifiers", []):
-        if identifier.get("type") == "ISBN_13":
-            isbn = identifier.get("identifier", "")
+    for id_info in info.get("industryIdentifiers", []):
+        if id_info.get("type") == "ISBN_13":
+            isbn = id_info.get("identifier", "")
             break
-        elif identifier.get("type") == "ISBN_10" and not isbn:
-            isbn = identifier.get("identifier", "")
+    if not isbn:
+        for id_info in info.get("industryIdentifiers", []):
+            if id_info.get("type") == "ISBN_10":
+                isbn = id_info.get("identifier", "")
+                break
 
-    # Extract publication year
-    published_date = volume_info.get("publishedDate", "")
-    year = published_date[:4] if published_date else ""
+    # Genre / categories
+    categories = info.get("categories", [])
+    genre = categories[0] if categories else ""
 
-    # Authors list → comma separated
-    authors_list = volume_info.get("authors", [])
-    authors_confirmed = ", ".join(authors_list)
+    # Pages
+    pages = str(info.get("pageCount", "")) if info.get("pageCount") else ""
 
-    # Categories
-    categories = ", ".join(volume_info.get("categories", []))
-
-    # Trim description to reasonable length
-    description = volume_info.get("description", "")
-    if len(description) > 300:
-        description = description[:297] + "..."
-
-    google_books_link = f"https://books.google.com/books?id={book_id}" if book_id else ""
+    # Cover image
+    image_links = info.get("imageLinks", {})
+    cover_url = (
+        image_links.get("thumbnail")
+        or image_links.get("smallThumbnail")
+        or ""
+    )
+    # Use HTTPS
+    if cover_url:
+        cover_url = cover_url.replace("http://", "https://")
 
     return {
-        "title_confirmed": volume_info.get("title", ""),
-        "authors_confirmed": authors_confirmed,
-        "year": year,
-        "isbn": isbn,
-        "categories": categories,
-        "language": volume_info.get("language", ""),
-        "page_count": str(volume_info.get("pageCount", "")),
-        "description": description,
-        "google_books_link": google_books_link,
-    }
-
-
-def _empty_metadata() -> dict:
-    """Return empty metadata dict when no match is found."""
-    return {
-        "title_confirmed": "",
-        "authors_confirmed": "",
-        "year": "",
-        "isbn": "",
-        "categories": "",
-        "language": "",
-        "page_count": "",
-        "description": "",
-        "google_books_link": "",
+        "Title": title,
+        "Author": author,
+        "Year": year,
+        "ISBN": isbn,
+        "Genre": genre,
+        "Pages": pages,
+        "Cover URL": cover_url,
     }
