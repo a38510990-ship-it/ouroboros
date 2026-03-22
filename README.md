@@ -12,7 +12,7 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.2.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.3.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
 
@@ -225,6 +225,12 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.3.0 -- Bookshelf Catalog App
+- **New: Bookshelf Catalog Telegram Bot** -- end-to-end application in `bookshelf/` that catalogs books from shelf photos. User sends a photo → VLM (OpenRouter) extracts book titles from spine text → Google Books API enriches metadata (author, year, ISBN, genre) → results saved to CSV on Google Drive.
+- **Zero-setup pattern** -- no Google Cloud project required. Uses `google.auth.default()` from Colab's already-authenticated session. Works out of the box with just a Telegram bot token and OpenRouter key.
+- **Deduplication** -- books are deduplicated by ISBN and Title+Author across scan sessions. Safe to re-scan the same shelf.
+- **Security** -- `.env` correctly excluded from git via `.gitignore`. Credentials never committed.
 
 ### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
 - **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
