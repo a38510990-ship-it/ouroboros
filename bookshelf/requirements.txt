@@ -1,5 +1,4 @@
-# Bookshelf Catalog Bot — Python Dependencies
-# Install with: pip install -r bookshelf/requirements.txt
+# Bookshelf Catalog Bot — Dependencies
 
 # Telegram Bot
 python-telegram-bot==21.5
@@ -7,9 +6,9 @@ python-telegram-bot==21.5
 # HTTP client (async)
 httpx>=0.27.0
 
-# Google OAuth + Sheets
+# Google Sheets
 gspread>=6.0.0
-google-auth>=2.30.0
+google-auth>=2.29.0
 google-auth-oauthlib>=1.2.0
 google-auth-httplib2>=0.2.0
 
