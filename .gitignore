@@ -4,6 +4,10 @@
 *.key
 *.pem
 
+# Allow .env.example files (templates, not real secrets)
+!.env.example
+!**/.env.example
+
 # IDE
 .cursor/
 .vscode/
