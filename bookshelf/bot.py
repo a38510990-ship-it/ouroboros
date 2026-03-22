@@ -6,12 +6,12 @@ to your personal Google Sheets catalog.
 
 Commands:
     /start   — welcome message and instructions
-    /catalog — show link to your Google Sheet catalog
+    /sheet   — show link to your Google Sheet catalog
     /help    — show help
 
 Usage:
-    1. Run auth_google.py once to set up Google OAuth
-    2. Copy env.example to .env and fill in your credentials
+    1. Run oauth_setup.py once to set up Google OAuth
+    2. Copy .env.example to .env and fill in your credentials
     3. Run: python bot.py
 """
 import logging
@@ -48,40 +48,34 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Bookshelf Catalog")
 GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
-
-# Vision model — can be overridden via env var
 VLM_MODEL = os.getenv("VLM_MODEL", "google/gemini-2.0-flash-001")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Message handlers
+# Message text
 # ─────────────────────────────────────────────────────────────────────────────
 
-WELCOME_MESSAGE = """📚 *Bookshelf Catalog Bot*
+WELCOME_MESSAGE = (
+    "📚 *Bookshelf Catalog Bot*\n\n"
+    "Send me a photo of your bookshelf and I'll:\n"
+    "1\\. Recognize all visible book titles\n"
+    "2\\. Look up metadata \\(author, year, ISBN\\)\n"
+    "3\\. Add new books to your Google Sheets catalog \\(duplicates skipped\\!\\)\n\n"
+    "*Tips for best results:*\n"
+    "• Make sure book spines are visible and readable\n"
+    "• Good lighting helps a lot\n"
+    "• Works with both vertical and horizontal books\n\n"
+    "Use /sheet to see your current catalog link\\."
+)
 
-Send me a photo of your bookshelf and I'll:
-1. Recognize all visible book titles
-2. Look up metadata (author, year, ISBN)
-3. Add them to your Google Sheets catalog
-
-*Tips for best results:*
-• Make sure book spines are visible and readable
-• Good lighting helps a lot
-• Include both vertical and horizontal books
-
-Use /catalog to see your current catalog link.
-"""
-
-HELP_MESSAGE = """*How to use:*
-
-📸 *Send a photo* — I'll recognize all books on the shelf
-
-*/catalog* — Get the link to your Google Sheets catalog
-*/start* — Show welcome message
-*/help* — Show this help
-
-*Your catalog* is stored in Google Sheets and grows with each new photo you send.
-You can share it, sort it, filter it — it's just a regular spreadsheet!
-"""
+HELP_MESSAGE = (
+    "*How to use:*\n\n"
+    "📸 *Send a photo* — I'll recognize all books on the shelf and add new ones\n\n"
+    "*/sheet* — Get the link to your Google Sheets catalog\n"
+    "*/start* — Show welcome message\n"
+    "*/help* — Show this help\n\n"
+    "*Your catalog* grows with each new photo\\. "
+    "Duplicates are automatically skipped — feel free to re\\-scan the same shelf later\\!"
+)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -95,18 +89,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     await update.message.reply_text(
         WELCOME_MESSAGE,
-        parse_mode="Markdown",
+        parse_mode="MarkdownV2",
         reply_markup=reply_markup,
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
-    await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
+    await update.message.reply_text(HELP_MESSAGE, parse_mode="MarkdownV2")
 
 
-async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /catalog command — show catalog link."""
+async def sheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sheet and /catalog commands — show catalog link."""
     sheet_url = get_sheet_url(GOOGLE_SHEET_NAME, GOOGLE_TOKEN_PATH)
 
     if sheet_url:
@@ -118,33 +112,34 @@ async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     else:
         await update.message.reply_text(
-            "📭 No catalog yet — send me a photo of your bookshelf to start!"
+            "📭 No catalog yet — send me a photo of your bookshelf to start!\n\n"
+            "If you haven't set up Google Sheets yet, run:\n"
+            "`python oauth_setup.py`",
+            parse_mode="Markdown",
         )
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle photo messages.
-    Downloads the photo, runs VLM recognition, enriches with Google Books,
-    appends to Google Sheet, and replies with results.
+    Downloads the photo → VLM recognition → Google Books enrichment
+    → append to Google Sheets (with deduplication) → reply with results.
     """
     msg = update.message
-    chat_id = update.effective_chat.id
-
-    # Status message
     status_msg = await msg.reply_text("📸 Got the photo! Analyzing your bookshelf...")
 
+    tmp_path = None
     try:
-        # Get the highest resolution version of the photo
+        # Download photo (highest resolution available)
         photo = msg.photo[-1]
         photo_file = await context.bot.get_file(photo.file_id)
 
-        # Download to a temp file
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = tmp.name
 
         await photo_file.download_to_drive(tmp_path)
-        logger.info(f"Downloaded photo: {tmp_path} ({Path(tmp_path).stat().st_size // 1024} KB)")
+        size_kb = Path(tmp_path).stat().st_size // 1024
+        logger.info(f"Downloaded photo: {tmp_path} ({size_kb} KB)")
 
         # Step 1: VLM recognition
         await status_msg.edit_text("🔍 Recognizing books with AI vision...")
@@ -157,11 +152,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         if not books_raw:
             await status_msg.edit_text(
-                "😕 I couldn't recognize any books in this photo.\n\n"
+                "😕 Couldn't recognize any books in this photo.\n\n"
                 "Tips:\n"
                 "• Make sure book spines are clearly visible\n"
                 "• Try better lighting\n"
-                "• The camera should face the spines directly"
+                "• Point the camera directly at the spines"
             )
             return
 
@@ -172,62 +167,67 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Step 2: Enrich with Google Books API
         books_enriched = enrich_books(books_raw)
 
-        # Step 3: Append to Google Sheets
+        # Step 3: Append to Google Sheets with deduplication
         await status_msg.edit_text("📊 Saving to your Google Sheets catalog...")
 
-        sheet_url = append_books(
+        sheet_url, added_count, skipped_count = append_books(
             books=books_enriched,
             sheet_name=GOOGLE_SHEET_NAME,
             token_path=GOOGLE_TOKEN_PATH,
         )
 
-        # Step 4: Build response message
+        # Step 4: Reply with results
+        open_btn = InlineKeyboardButton("📊 Open Catalog", url=sheet_url)
+
+        if added_count == 0 and skipped_count > 0:
+            await status_msg.edit_text(
+                f"🔄 All {skipped_count} book(s) are already in your catalog!\n"
+                "Nothing new to add — your catalog is up to date.",
+                reply_markup=InlineKeyboardMarkup([[open_btn]]),
+            )
+            return
+
         book_list = _format_book_list(books_enriched)
-        keyboard = [[InlineKeyboardButton("📊 Open Catalog", url=sheet_url)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        result_text = f"✅ Added *{added_count}* new book(s) to your catalog!"
+        if skipped_count > 0:
+            result_text += f"\n⏭ Skipped *{skipped_count}* duplicate(s)"
+        result_text += f"\n\n{book_list}"
 
         await status_msg.edit_text(
-            f"✅ Added *{len(books_enriched)} book(s)* to your catalog!\n\n"
-            f"{book_list}",
+            result_text,
             parse_mode="Markdown",
-            reply_markup=reply_markup,
+            reply_markup=InlineKeyboardMarkup([[open_btn]]),
         )
 
     except FileNotFoundError as e:
         logger.error(f"File error: {e}")
         await status_msg.edit_text(
-            "❌ Error: Google credentials not found.\n"
-            "Please run `python auth_google.py` on the server to set up authentication."
+            "❌ Google credentials not found.\n\n"
+            "Please run `python oauth_setup.py` to set up Google authentication."
         )
     except RuntimeError as e:
         logger.error(f"Runtime error: {e}")
-        await status_msg.edit_text(
-            f"❌ Error processing image:\n{str(e)[:200]}"
-        )
+        await status_msg.edit_text(f"❌ Error processing image:\n{str(e)[:300]}")
     except Exception as e:
         logger.exception(f"Unexpected error in photo_handler: {e}")
         await status_msg.edit_text(
-            "❌ Something went wrong. Please try again.\n"
-            f"Error: {str(e)[:100]}"
+            f"❌ Something went wrong. Please try again.\nError: {str(e)[:150]}"
         )
     finally:
-        # Clean up temp file
-        try:
+        if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
-def _format_book_list(books: list[dict]) -> str:
-    """Format the list of books for display in Telegram."""
+def _format_book_list(books: list) -> str:
+    """Format the list of books for a Telegram Markdown message."""
     lines = []
-    for i, book in enumerate(books[:10], 1):  # show max 10 in message
+    for i, book in enumerate(books[:10], 1):
         title = book.get("title_confirmed") or book.get("title", "Unknown")
         author = book.get("authors_confirmed") or book.get("author", "")
         year = book.get("year", "")
 
         line = f"*{i}.* {title}"
-        if author:
+        if author and author.lower() != "unknown":
             line += f" — _{author}_"
         if year:
             line += f" ({year})"
@@ -239,27 +239,22 @@ def _format_book_list(books: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _non_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle non-photo messages with a hint."""
-    pass  # Ignore non-photo messages silently
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Start the bot."""
-    logger.info(f"Starting Bookshelf Catalog Bot...")
-    logger.info(f"Sheet name: {GOOGLE_SHEET_NAME}")
+    """Start the Telegram bot."""
+    logger.info("Starting Bookshelf Catalog Bot...")
+    logger.info(f"Google Sheet: '{GOOGLE_SHEET_NAME}'")
     logger.info(f"VLM model: {VLM_MODEL}")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("catalog", catalog_command))
+    app.add_handler(CommandHandler("sheet", sheet_command))
+    app.add_handler(CommandHandler("catalog", sheet_command))  # alias
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
