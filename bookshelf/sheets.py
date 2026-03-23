@@ -9,6 +9,7 @@ sheets.py — Сохраняет каталог книг как CSV прямо �
 
 import csv
 import logging
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,7 +25,7 @@ class BookshelfSheet:
         self.path = Path(path)
 
     def _ensure_file(self) -> None:
-        """Создаёт CSV файл с заголовками если не существует."""
+        """Создаёт CSV файл с заголовками если не существует, затем мигрирует схему."""
         if not self.path.parent.exists():
             raise RuntimeError(
                 f"Google Drive не смонтирован или путь недоступен: {self.path.parent}\n"
@@ -35,6 +36,46 @@ class BookshelfSheet:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
             logger.info(f"Created new catalog: {self.path}")
+        else:
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """
+        Добавляет отсутствующие колонки в существующий CSV-файл.
+
+        Если файл был создан до добавления новых полей (например, Location),
+        метод перезаписывает файл, проставляя пустые значения в новых столбцах
+        для старых записей. Оригинал сохраняется как .bak перед перезаписью.
+        """
+        with self.path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_columns = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        missing = [col for col in CSV_COLUMNS if col not in existing_columns]
+        if not missing:
+            return  # Схема актуальна, ничего делать не нужно
+
+        logger.info(f"Schema migration: adding columns {missing} to {self.path}")
+
+        # Бэкап оригинала
+        bak_path = self.path.with_suffix(".csv.bak")
+        shutil.copy2(self.path, bak_path)
+        logger.info(f"Backup saved: {bak_path}")
+
+        # Новый порядок колонок: сначала всё что уже есть, потом новые
+        new_columns = existing_columns + missing
+
+        # Перезаписываем файл с новыми столбцами (пустые значения для старых строк)
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=new_columns)
+            writer.writeheader()
+            for row in rows:
+                for col in missing:
+                    row.setdefault(col, "")
+                writer.writerow({k: row.get(k, "") for k in new_columns})
+
+        logger.info(f"Schema migration complete: {len(rows)} rows updated, {len(missing)} columns added")
 
     def _load_existing(self) -> list[dict]:
         """Загружает существующие книги из CSV."""
@@ -77,7 +118,7 @@ class BookshelfSheet:
         self._ensure_file()
         existing = self._load_existing()
 
-        # Подтягиваем актуальные колонки из файла (на случай если файл уже имеет Location)
+        # Подтягиваем актуальные колонки из файла (после возможной миграции)
         actual_columns = self._get_actual_columns()
 
         added = []
