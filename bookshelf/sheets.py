@@ -14,7 +14,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CSV_COLUMNS = ["Title", "Author", "Year", "ISBN", "Genre", "Pages", "Added_At"]
+CSV_COLUMNS = ["Title", "Author", "Year", "ISBN", "Genre", "Pages", "Added_At", "Location"]
 
 DEFAULT_PATH = "/content/drive/MyDrive/Bookshelf Catalog.csv"
 
@@ -63,15 +63,22 @@ class BookshelfSheet:
                 return True
         return False
 
-    def add_books(self, books: list[dict]) -> tuple[list[dict], list[dict]]:
+    def add_books(self, books: list[dict], location: str = "") -> tuple[list[dict], list[dict]]:
         """
         Добавляет книги в CSV, пропуская дубликаты.
+
+        Args:
+            books: список книг для добавления
+            location: расположение полки (опционально, пользователь может заполнить сам)
 
         Returns:
             (added, skipped) — списки добавленных и пропущенных книг
         """
         self._ensure_file()
         existing = self._load_existing()
+
+        # Подтягиваем актуальные колонки из файла (на случай если файл уже имеет Location)
+        actual_columns = self._get_actual_columns()
 
         added = []
         skipped = []
@@ -82,18 +89,29 @@ class BookshelfSheet:
             if self._is_duplicate(book, existing + new_rows):
                 skipped.append(book)
             else:
-                row = {col: book.get(col, "") for col in CSV_COLUMNS}
+                row = {col: book.get(col, "") for col in actual_columns}
                 row["Added_At"] = now
+                if "Location" in actual_columns:
+                    row["Location"] = location
                 new_rows.append(row)
                 added.append(row)
 
         if new_rows:
             with self.path.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer = csv.DictWriter(f, fieldnames=actual_columns)
                 writer.writerows(new_rows)
             logger.info(f"Added {len(new_rows)} books to {self.path}")
 
         return added, skipped
+
+    def _get_actual_columns(self) -> list[str]:
+        """Возвращает колонки из существующего файла, или дефолтные если файл новый."""
+        if self.path.exists():
+            with self.path.open("r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames:
+                    return list(reader.fieldnames)
+        return CSV_COLUMNS
 
     def get_url(self) -> str:
         """Возвращает информацию о расположении файла."""
