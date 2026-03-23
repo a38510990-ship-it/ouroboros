@@ -1,6 +1,6 @@
 # 📚 Bookshelf Catalog Bot
 
-Telegram-бот, который распознаёт книги на фото книжной полки и сохраняет их в Google Sheets.
+Telegram-бот, который распознаёт книги на фото книжной полки и сохраняет их в CSV-файл на Google Drive.
 
 ## Как это работает
 
@@ -11,18 +11,18 @@ Telegram-бот, который распознаёт книги на фото к
                        ↓
               Google Books API — название, автор, год, ISBN
                        ↓
-              Google Sheets (твой Drive) — таблица накапливается
+              CSV-файл в твоём Google Drive — таблица накапливается
 ```
 
 ## Запуск в Google Colab
 
-Никакого Google Cloud проекта не нужно. Таблица создаётся прямо в Drive,
+Никакого Google Cloud проекта не нужно. CSV создаётся прямо в Drive,
 который уже подключён к Colab.
 
 ### Ячейка 1 — Установить зависимости
 
 ```python
-!pip install -q python-telegram-bot gspread google-auth httpx python-dotenv
+!pip install -q python-telegram-bot httpx python-dotenv
 ```
 
 ### Ячейка 2 — Задать переменные и запустить бота
@@ -47,13 +47,16 @@ print("✅ Бот запущен! Напиши /start своему боту в T
 | Команда | Описание |
 |---------|----------|
 | `/start` | Приветствие и инструкция |
-| `/sheet` | Ссылка на таблицу в Google Drive |
+| `/sheet` | Путь к CSV-файлу в Google Drive |
 | Фото 📷 | Распознать книги и добавить в таблицу |
 
-## Структура таблицы
+## Структура таблицы (CSV)
 
-| Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added |
-|-------|--------|------|------|-------|-------|-----------|------------|
+| Title | Author | Year | ISBN | Genre | Pages | Cover URL | Date Added | Location |
+|-------|--------|------|------|-------|-------|-----------|------------|----------|
+
+Файл сохраняется как `Bookshelf Catalog.csv` в корне Google Drive (`MyDrive/`).
+Можно открыть через Google Таблицы для фильтрации и сортировки.
 
 ## Переменные окружения
 
@@ -61,18 +64,18 @@ print("✅ Бот запущен! Напиши /start своему боту в T
 |-----------|-------------|----------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | Токен от [@BotFather](https://t.me/BotFather) |
 | `OPENROUTER_API_KEY` | ✅ | Ключ от [openrouter.ai](https://openrouter.ai) |
-| `VLM_MODEL` | ❌ | VLM модель (по умолчанию: `google/gemini-2.0-flash-thinking-exp:free`) |
-| `GOOGLE_SHEET_NAME` | ❌ | Название таблицы (по умолчанию: `Bookshelf Catalog`) |
+| `VLM_MODEL` | ❌ | VLM модель (по умолчанию: `google/gemini-2.0-flash-001`) |
+| `CATALOG_FILENAME` | ❌ | Имя CSV-файла (по умолчанию: `Bookshelf Catalog.csv`) |
 
 ## VLM модели
 
 ```bash
-# Бесплатные:
-VLM_MODEL=google/gemini-2.0-flash-thinking-exp:free
-
-# Платные (лучше качество):
-VLM_MODEL=anthropic/claude-3.5-sonnet
+# Быстрые и дешёвые:
 VLM_MODEL=google/gemini-2.0-flash-001
+
+# Лучше качество:
+VLM_MODEL=anthropic/claude-3.5-sonnet
+VLM_MODEL=openai/gpt-4o
 ```
 
 ## Файлы
@@ -83,7 +86,7 @@ bookshelf/
 ├── requirements.txt # Зависимости
 ├── bot.py           # Telegram-бот
 ├── vision.py        # OpenRouter VLM — распознавание книг
-├── sheets.py        # Google Sheets через Drive-авторизацию Colab
+├── sheets.py        # CSV-хранилище на Google Drive
 ├── books_api.py     # Google Books API — обогащение метаданных
 └── .env.example     # Пример переменных
 ```
