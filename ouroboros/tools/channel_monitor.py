@@ -156,11 +156,14 @@ def _check_channel(ctx: ToolContext, channel: str = DEFAULT_CHANNEL, mark_read: 
     new_messages = [m for m in all_messages if m["id"] > last_id]
     new_max_id = max(m["id"] for m in all_messages)
 
-    if mark_read and new_messages:
-        _save_state(ctx, channel, {
-            "last_id": new_max_id,
-            "updated_at": datetime.utcnow().isoformat(),
-        })
+    if mark_read:
+        # Always persist last_checked so background processes can confirm the
+        # monitor has run, even when there are no new posts.
+        new_state = {
+            "last_id": new_max_id if new_messages else last_id,
+            "last_checked": datetime.utcnow().isoformat(),
+        }
+        _save_state(ctx, channel, new_state)
 
     if new_messages:
         formatted = "\n\n---\n\n".join(_format_message(m) for m in new_messages)
