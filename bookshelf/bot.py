@@ -20,6 +20,7 @@ bot.py — Bookshelf Catalog Telegram Bot
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,11 +40,28 @@ from vision import recognize_books
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
+# ---------------------------------------------------------------------------
+# Logging — stdout + rotating file (bot.log, max 2 MB × 3 backups)
+# ---------------------------------------------------------------------------
+_log_file = HERE / "bot.log"
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_file_handler = RotatingFileHandler(
+    _log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(_fmt)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_fmt)
+
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
+    handlers=[_console_handler, _file_handler],
 )
 logger = logging.getLogger(__name__)
+logger.info("Logging initialised. Log file: %s", _log_file)
+# ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
@@ -73,11 +91,12 @@ async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_html(f"📊 <b>Твой каталог:</b>\n{url}")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка доступа к таблице: {e}")
-        logger.error(f"Sheet access error: {e}", exc_info=True)
+        logger.error("Sheet access error: %s", e, exc_info=True)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info(f"Photo received from user {update.effective_user.id}")
+    user_id = update.effective_user.id
+    logger.info("Photo received from user %s", user_id)
 
     processing_msg = await update.message.reply_text("📷 Фото получено! Анализирую полку...")
 
@@ -85,13 +104,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     photo = update.message.photo[-1]
     photo_file = await context.bot.get_file(photo.file_id)
     image_bytes = bytes(await photo_file.download_as_bytearray())
-    logger.info(f"Downloaded photo: {len(image_bytes)} bytes")
+    logger.info("Downloaded photo: %d bytes (user=%s)", len(image_bytes), user_id)
 
     # Распознать книги через VLM
     await processing_msg.edit_text("🔍 Распознаю книги с помощью AI...")
     try:
         raw_books = await recognize_books(image_bytes)
     except RuntimeError as e:
+        logger.error("VLM recognition failed (user=%s): %s", user_id, e, exc_info=True)
         await processing_msg.edit_text(
             f"❌ <b>Не удалось распознать книги:</b>\n{e}\n\n"
             "Проверь, что OPENROUTER_API_KEY задан.",
@@ -100,6 +120,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not raw_books:
+        logger.info("No books detected in photo (user=%s)", user_id)
         await processing_msg.edit_text(
             "😕 <b>Книги не найдены.</b>\n\n"
             "Советы:\n"
@@ -110,21 +131,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    logger.info(f"Recognized {len(raw_books)} book(s)")
+    logger.info("Recognized %d book(s) (user=%s)", len(raw_books), user_id)
 
     # Обогатить через Google Books API
     await processing_msg.edit_text(f"📖 Нашёл {len(raw_books)} книг(и)! Ищу детали...")
     enriched_books = await enrich_books(raw_books)
+    logger.info(
+        "Enriched %d/%d book(s) via Google Books (user=%s)",
+        sum(1 for b in enriched_books if b.get("ISBN")),
+        len(enriched_books),
+        user_id,
+    )
 
     # Добавить в Google Sheets
     await processing_msg.edit_text("📊 Добавляю в каталог...")
     try:
         added, skipped = _sheet.add_books(enriched_books)
     except Exception as e:
+        logger.error("Sheets write error (user=%s): %s", user_id, e, exc_info=True)
         await processing_msg.edit_text(f"❌ Не удалось сохранить в таблицу: {e}")
-        logger.error(f"Sheets error: {e}", exc_info=True)
         return
 
+    logger.info(
+        "Catalog updated: added=%d skipped=%d (user=%s)", len(added), len(skipped), user_id
+    )
     await processing_msg.edit_text(_format_result(added, skipped), parse_mode="HTML")
 
 
