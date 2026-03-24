@@ -4,6 +4,16 @@ version = "6.3.0"
 description = "Self-creating agent"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+# Voice Note Alchemist — audio transcription pipeline
+voice = [
+    "faster-whisper>=1.0.0",
+]
+# Full dev/runtime extras
+all = [
+    "faster-whisper>=1.0.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
