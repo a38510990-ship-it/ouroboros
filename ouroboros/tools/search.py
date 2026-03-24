@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 import urllib.parse
 import urllib.request
 import http.cookiejar
@@ -101,6 +100,20 @@ def _try_google_cse(query: str) -> Optional[str]:
         return json.dumps({"error": repr(e), "provider": "google_cse"}, ensure_ascii=False)
 
 
+def _clean_ddg_url(url: str) -> str:
+    """Strip DDG redirect tracking parameters from result URLs."""
+    # DDG wraps URLs like: //duckduckgo.com/l/?uddg=https%3A%2F%2F...&rut=abc123
+    if "uddg=" in url:
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        if "uddg" in params:
+            return urllib.parse.unquote(params["uddg"][0])
+    # Strip trailing &rut=... tracking suffix
+    url = re.sub(r"&rut=[a-f0-9]+$", "", url)
+    url = re.sub(r"&rut=[a-f0-9]+&.*$", "", url)
+    return url.strip()
+
+
 def _try_duckduckgo_html(query: str) -> Optional[str]:
     """Search via DuckDuckGo HTML interface — real organic results, no API key needed.
 
@@ -137,11 +150,7 @@ def _try_duckduckgo_html(query: str) -> Optional[str]:
         # Parse results
         titles = re.findall(r'class="result__a"[^>]*>([^<]+)<', html)
         snippets_raw = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        urls = re.findall(r'class="result__url"[^>]*>\s*(https?://[^\s<]+)', html)
-        # Fallback: extract href from result__a links
-        if not urls:
-            raw_urls = re.findall(r'class="result__a"[^>]*href="([^"]+)"', html)
-            urls = [urllib.parse.unquote(u.split("uddg=")[-1]) if "uddg=" in u else u for u in raw_urls]
+        raw_hrefs = re.findall(r'class="result__a"[^>]*href="([^"]+)"', html)
 
         # Clean HTML tags from snippets
         def strip_tags(s: str) -> str:
@@ -150,8 +159,9 @@ def _try_duckduckgo_html(query: str) -> Optional[str]:
         results = []
         for i, title in enumerate(titles[:8]):
             snippet = strip_tags(snippets_raw[i]) if i < len(snippets_raw) else ""
-            url = urls[i].strip() if i < len(urls) else ""
-            results.append({"title": title.strip(), "snippet": snippet, "url": url})
+            raw_url = raw_hrefs[i] if i < len(raw_hrefs) else ""
+            clean_url = _clean_ddg_url(raw_url)
+            results.append({"title": title.strip(), "snippet": snippet, "url": clean_url})
 
         if not results:
             return None
