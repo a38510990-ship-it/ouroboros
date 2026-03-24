@@ -1,9 +1,10 @@
 """Web search tool — multi-provider with graceful fallback.
 
 Provider priority:
-  1. OpenAI Responses API  (requires OPENAI_API_KEY)
-  2. Google Custom Search  (requires GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX)
-  3. DuckDuckGo Instant Answer API  (no key, always available, limited results)
+  1. OpenAI Responses API      (requires OPENAI_API_KEY)
+  2. Google Custom Search      (requires GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX)
+  3. DuckDuckGo HTML scrape    (no key, session-based, full organic results)
+  4. DuckDuckGo Instant Answer (no key, always available, limited results)
 
 The first provider that has its prerequisites set is used.
 If all fail, a structured error is returned instead of raising.
@@ -13,6 +14,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
+import urllib.parse
+import urllib.request
+import http.cookiejar
 from typing import List, Optional
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
@@ -64,9 +70,6 @@ def _try_google_cse(query: str) -> Optional[str]:
     if not api_key or not cx:
         return None
     try:
-        import urllib.parse
-        import urllib.request
-
         params = urllib.parse.urlencode({
             "key": api_key,
             "cx": cx,
@@ -98,6 +101,75 @@ def _try_google_cse(query: str) -> Optional[str]:
         return json.dumps({"error": repr(e), "provider": "google_cse"}, ensure_ascii=False)
 
 
+def _try_duckduckgo_html(query: str) -> Optional[str]:
+    """Search via DuckDuckGo HTML interface — real organic results, no API key needed.
+
+    Uses a session cookie jar + realistic browser headers to avoid bot detection.
+    Returns None if bot detection triggers or on network error, so the cascade
+    can fall back to the Instant Answer API.
+    """
+    try:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = [
+            ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"),
+            ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+            ("Accept-Language", "en-US,en;q=0.5"),
+            ("Accept-Encoding", "identity"),
+            ("DNT", "1"),
+            ("Connection", "keep-alive"),
+            ("Upgrade-Insecure-Requests", "1"),
+        ]
+
+        # Step 1: get homepage to initialize session (reduces bot detection)
+        opener.open("https://duckduckgo.com/", timeout=10)
+
+        # Step 2: HTML search
+        params = urllib.parse.urlencode({"q": query, "kl": "wt-wt"})
+        url = f"https://html.duckduckgo.com/html/?{params}"
+        with opener.open(url, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Bot detection check
+        if "anomaly" in html or "challenge" in html or "result__a" not in html:
+            return None
+
+        # Parse results
+        titles = re.findall(r'class="result__a"[^>]*>([^<]+)<', html)
+        snippets_raw = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        urls = re.findall(r'class="result__url"[^>]*>\s*(https?://[^\s<]+)', html)
+        # Fallback: extract href from result__a links
+        if not urls:
+            raw_urls = re.findall(r'class="result__a"[^>]*href="([^"]+)"', html)
+            urls = [urllib.parse.unquote(u.split("uddg=")[-1]) if "uddg=" in u else u for u in raw_urls]
+
+        # Clean HTML tags from snippets
+        def strip_tags(s: str) -> str:
+            return re.sub(r"<[^>]+>", "", s).strip()
+
+        results = []
+        for i, title in enumerate(titles[:8]):
+            snippet = strip_tags(snippets_raw[i]) if i < len(snippets_raw) else ""
+            url = urls[i].strip() if i < len(urls) else ""
+            results.append({"title": title.strip(), "snippet": snippet, "url": url})
+
+        if not results:
+            return None
+
+        answer = "\n\n".join(
+            f"**{r['title']}**\n{r['snippet']}\n{r['url']}"
+            for r in results
+        )
+
+        return json.dumps(
+            {"answer": answer, "results": results, "provider": "duckduckgo_html"},
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception:
+        return None
+
+
 def _try_duckduckgo(query: str) -> str:
     """Search via DuckDuckGo Instant Answer API (no key required).
 
@@ -105,9 +177,6 @@ def _try_duckduckgo(query: str) -> str:
     empty results for highly specific queries. Always returns a result.
     """
     try:
-        import urllib.parse
-        import urllib.request
-
         params = urllib.parse.urlencode({
             "q": query,
             "format": "json",
@@ -164,7 +233,12 @@ def _web_search(ctx: ToolContext, query: str) -> str:
     if result is not None:
         return result
 
-    # Provider 3: DuckDuckGo (no key, always available, limited results)
+    # Provider 3: DuckDuckGo HTML scrape (real organic results, no key, session-based)
+    result = _try_duckduckgo_html(query)
+    if result is not None:
+        return result
+
+    # Provider 4: DuckDuckGo Instant Answer (no key, always available, limited results)
     return _try_duckduckgo(query)
 
 
