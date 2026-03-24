@@ -12,7 +12,7 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.3.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.4.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
 
@@ -225,6 +225,16 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.4.0 -- Voice Note Alchemist
+- **New: Voice Note Alchemist** -- standalone Telegram bot in `voice_alchemist/` that transcribes voice messages and audio files to text. Send a voice note → get back a transcript + optional LLM summary, saved to Google Drive.
+- **Transcription engine** -- `faster-whisper` (tiny int8 model, ~1.8x realtime on CPU). Auto-installs in Colab. Handles OGG, MP3, M4A, WAV, AAC, WebM via ffmpeg.
+- **Optional LLM summarisation** -- if `OPENROUTER_API_KEY` is set and transcript > 500 chars, calls a light model (default: `gemini-2.0-flash-001`) for a structured summary with action items.
+- **Access control** -- `ALLOWED_TELEGRAM_ID` env var restricts the bot to a single user.
+- **Drive output** -- transcripts saved to `MyDrive/Ouroboros/voice_alchemist/processed/YYYY-MM-DD_<user>_<msg>.txt`.
+- **`ouroboros/transcribe.py`** -- shared transcription module available to the main agent.
+- **Search resilience** -- `search.py` now has three-provider fallback: OpenAI Responses API → Google CSE → DDG HTML scraping (no API key required for basic web search).
+
 
 ### v6.3.0 -- Bookshelf Catalog App
 - **New: Bookshelf Catalog Telegram Bot** -- end-to-end application in `bookshelf/` that catalogs books from shelf photos. User sends a photo → VLM (OpenRouter) extracts book titles from spine text → Google Books API enriches metadata (author, year, ISBN, genre) → results saved to CSV on Google Drive.
