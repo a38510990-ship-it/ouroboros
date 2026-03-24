@@ -3,3 +3,9 @@ openai>=1.0.0
 requests
 playwright
 playwright-stealth
+
+# Voice Note Alchemist — audio transcription
+# Install: pip install faster-whisper
+# Note: not auto-installed with pip install -e . because Colab may provide
+# ctranslate2 separately. Run `pip install faster-whisper` in Colab first.
+faster-whisper>=1.0.0
