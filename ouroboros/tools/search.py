@@ -154,7 +154,8 @@ def _try_duckduckgo_html(query: str) -> Optional[str]:
 
         # Clean HTML tags from snippets
         def strip_tags(s: str) -> str:
-            return re.sub(r"<[^>]+>", "", s).strip()
+            import html as _html
+            return _html.unescape(re.sub(r"<[^>]+>", "", s).strip())
 
         results = []
         for i, title in enumerate(titles[:8]):
